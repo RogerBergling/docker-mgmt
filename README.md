@@ -1,23 +1,136 @@
 # docker-mgmt
 
-Menu-driven, audited management of local Docker Compose projects.
+A safer, menu-driven way to check and update Docker Compose services on one
+host.
 
-`docker-mgmt` is a Python 3 tool for a single Docker host. It scans directories
-for Compose files, shows what is running, checks for image updates by pulling
-and comparing image IDs, and lets an operator explicitly apply updates with
-`docker compose up -d`. It also covers container logs/actions, health, disk
-cleanup, Compose validation, a security review, and an append-only audit log.
+`docker-mgmt` scans your Compose files, shows what is running, checks for image
+updates by pulling and comparing image IDs, and lets you explicitly apply
+updates with `docker compose up -d`. It never updates containers on its own.
 
-It deliberately does **not** implement Watchtower-style automatic updates. See
-[Why not Watchtower?](#why-not-watchtower) and [SECURITY.md](SECURITY.md).
-
-> **Privilege warning:** Docker access is effectively root access. Anyone who
-> can run this tool, or run `docker` directly, can control the host. Restrict
-> access to trusted administrators and protect the configuration file.
+> **Docker access is root-equivalent.** Restrict this tool to trusted
+> administrators and protect its configuration file. See
+> [SECURITY.md](SECURITY.md).
 
 ---
 
-## Contents
+## The easy way (5 minutes)
+
+**If you only read one section, read this one.** The small version is:
+
+> Start the menu, choose a project, check for updates, then apply. Pulling does
+> not restart anything; applying is a separate, explicit confirmation.
+
+You do not need to understand the full reference below to get started. Try the
+read-only checks first, then use a non-critical project for your first update.
+
+### 1. Check the basics
+
+You need Linux, Python 3.9+, Docker Engine, and the Compose v2 plugin:
+
+```bash
+docker --version
+docker compose version
+python3 --version
+```
+
+If those work, you are ready. Running as `root` or with `sudo` is recommended.
+
+### 2. Get the tool
+
+```bash
+git clone https://github.com/RogerBergling/docker-mgmt.git
+cd docker-mgmt
+```
+
+No build step and no pip packages are required.
+
+### 3. Run the read-only doctor
+
+```bash
+sudo ./docker-mgmt doctor
+```
+
+This checks Docker, Compose, the audit path, the operation lock, and your scan
+roots. It does not change anything.
+
+### 4. Create the configuration
+
+```bash
+sudo mkdir -p /etc/docker-mgmt
+sudo cp config.example.ini /etc/docker-mgmt/config.ini
+sudo chown root:root /etc/docker-mgmt/config.ini
+sudo chmod 0644 /etc/docker-mgmt/config.ini
+sudo nano /etc/docker-mgmt/config.ini
+```
+
+At minimum, check `[scan] roots`. Point it at the directories that contain your
+Compose files, for example:
+
+```ini
+[scan]
+roots = /opt, /srv, /var/www
+```
+
+The built-in defaults are `/opt`, `/srv`, `/var/www`, `/home`, and `/root`;
+setting `roots` replaces that list.
+
+### 5. Start the menu
+
+```bash
+sudo ./docker-mgmt
+```
+
+Then use the numbered menu:
+
+```text
+2  Compose projects
+   → select your project
+   → 1  Check for updates      (pulls images; does not restart)
+   → 2  Pull and apply updates (pulls, then asks before recreating)
+```
+
+Useful keys in every menu:
+
+- `?` — show help
+- `/text` — filter a long list
+- `n` / `p` — next / previous page
+- `0` — go back (or exit from the main menu)
+- `q` — quit
+
+### The smallest useful command set
+
+```bash
+sudo ./docker-mgmt doctor                  # read-only health check
+sudo ./docker-mgmt scan                    # find Compose projects
+sudo ./docker-mgmt status                  # show containers
+sudo ./docker-mgmt check --yes             # pull and compare; no restarts
+sudo ./docker-mgmt update myproject --yes  # explicit pull + up -d
+sudo ./docker-mgmt logs myproject --follow # logs
+```
+
+`check --json` exits with code `10` when updates are available. That makes it
+easy to feed into monitoring or a cron job.
+
+### What the easy version actually does
+
+- **Scans** your configured directories for Compose files.
+- **Shows** projects, containers, health, and ports.
+- **Pulls** images only when you ask, then tells you what changed.
+- **Applies** updates only after you confirm.
+- **Logs** mutating actions to an audit file.
+- **Never** runs Watchtower or updates/restarts containers automatically.
+- **Never** prunes volumes.
+
+The rest of this README is the reference: configuration, automation, security
+details, update semantics, and troubleshooting. Read it when you need it.
+
+---
+
+## Detailed documentation
+
+Everything below is optional for a first run. Jump to the section you need.
+
+### Contents
 
 - [What it does](#what-it-does)
 - [Why not Watchtower?](#why-not-watchtower)
@@ -112,28 +225,12 @@ before using any mutating action.
 
 ## Install and run
 
-### Directly from the checkout (recommended for a root-run server)
-
-```bash
-git clone <your-repo-url> docker-mgmt
-cd docker-mgmt
-
-# Read-only diagnostics first:
-sudo ./docker-mgmt doctor
-
-# Create the root-controlled configuration:
-sudo mkdir -p /etc/docker-mgmt
-sudo cp config.example.ini /etc/docker-mgmt/config.ini
-sudo chown root:root /etc/docker-mgmt/config.ini
-sudo chmod 0644 /etc/docker-mgmt/config.ini
-sudo editor /etc/docker-mgmt/config.ini
-
-# Start the menu:
-sudo ./docker-mgmt
-```
+The shortest path is [The easy way](#the-easy-way-5-minutes) above: clone the
+repository, run `doctor`, copy the example configuration, and start the menu.
 
 `./docker-mgmt` and `python3 -m docker_mgmt` are equivalent. No build step is
-needed.
+needed, and there are no runtime dependencies beyond Python 3.9+ and the Docker
+CLI/Compose plugin.
 
 ### Optional installation
 
