@@ -20,6 +20,8 @@ id_ed25519
 credentials.json
 terraform.tfstate
 terraform.tfstate.*
+config.ini
+config.local.ini
 
 # ---------------------------------------------------------------------------
 # Operating systems and editors
