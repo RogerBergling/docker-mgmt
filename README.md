@@ -44,6 +44,11 @@ cd docker-mgmt
 
 No build step and no pip packages are required.
 
+> **Production note:** run the tool from a root-owned directory (for example
+> `/opt/docker-mgmt`), not from a user-writable home directory. If root executes
+> a checkout that another user can edit, that user can modify the code and run
+> commands as root. The menu prints a warning when it detects this.
+
 ### 3. Run the read-only doctor
 
 ```bash
@@ -271,9 +276,10 @@ Overrides:
 When running as root, the config file and every parent directory up to `/` must
 be root-owned and not group- or world-writable. Sticky root-owned directories
 such as `/tmp` are tolerated because non-owners cannot remove a root-owned entry
-there. This prevents a local user from changing scan roots or other settings
-used by a root process. When running as
-non-root, a world-writable config produces a warning.
+there. When running as a non-root user with Docker access, the config must be
+owned by you or root and must not be group- or world-writable. A config file is
+a control input for a Docker-privileged process; another local user who can
+change it can redirect the tool to attacker-controlled Compose files.
 
 ### Configuration reference
 
@@ -294,7 +300,8 @@ non-root, a world-writable config produces a warning.
 | `audit` | `max_bytes` | `10485760` | Rotate to `<name>.1` above this size. |
 | `ui` | `color` | `auto` | `auto`, `always`, or `never`. `NO_COLOR` always wins. |
 | `ui` | `page_size` | `20` | Menu page size (5–100). |
-| `security` | `allow_unsafe_ownership` | `false` | **Dangerous.** Allow mutating actions when project files are owned by non-root users or are writable by them. |
+| `security` | `allow_unsafe_ownership` | `false` | **Dangerous.** Allow mutating actions when project files are not controlled by root/current user or are group/world-writable. |
+| `security` | `allow_unverified_references` | `false` | **Dangerous.** Allow mutating actions when Compose uses `include`/`extends` references that cannot be individually trust-checked. |
 
 The operation lock path is not configurable:
 
@@ -302,13 +309,17 @@ The operation lock path is not configurable:
 - non-root: `$XDG_RUNTIME_DIR/docker-mgmt.lock`, or a private directory under
   the system temporary directory
 
-See [`config.example.ini`](config.example.ini) for a commented example.
+See [`config.example.ini`](config.example.ini) for a commented example. Copy it
+to a controlled location rather than pointing `--config` at a checkout:
+developer checkouts are often group-writable, and the config permission check
+will correctly reject that.
 
 ### Scan behaviour
 
 - Standard Compose files are recognised. Standard override files
-  (`compose.override.yaml`, etc.) are automatically loaded by Compose and are
-  not treated as separate projects.
+  (`compose.override.yaml`, etc.) are merged explicitly with the base file so
+  they are validated and included in trust checks, and are not treated as
+  separate projects.
 - If multiple base files exist in one directory, the highest-precedence name is
   used (`compose.yaml` first) and a warning is shown.
 - If two different Compose files resolve to the same project name, both are
@@ -317,6 +328,11 @@ See [`config.example.ini`](config.example.ini) for a commented example.
   or move them into separate directories.
 - If a running project's files differ from a scanned project with the same name,
   the scanned project is also blocked.
+- Projects that use Compose `include` or service `extends` are blocked from
+  mutating actions by default because the referenced files cannot be enumerated
+  and individually trust-checked. Review those files and set
+  `security.allow_unverified_references=true` only if you accept that residual
+  risk.
 - If a project was started with an explicit `-p NAME` and no top-level `name:`,
   the running name is adopted and passed explicitly to Compose. A warning asks
   you to add a top-level `name:` so the intent is visible in the file.
@@ -472,7 +488,17 @@ Full details and a threat model are in [SECURITY.md](SECURITY.md). Key controls:
   restart. Updates are pulled only when an operator runs a check, and containers
   are recreated only after a separate confirmation.
 - **No shell.** Docker commands are executed as argument vectors with
-  `shell=False`. Paths and project names cannot break out into a shell.
+  `shell=False`. Paths and project names cannot break out into a shell. Compose
+  file paths are normalized to absolute paths, and user/container/image operands
+  are placed after `--` where the Docker CLI supports it.
+- **Root environment check.** When running as root, the resolved `docker`
+  executable and its parent path must be root-controlled; a user-writable
+  `docker` earlier in `PATH` is refused. Root runs also refuse a `PATH` or
+  `DOCKER_CONFIG`/`HOME/.docker` path that is not root-controlled, because
+  Docker can load credential helpers and CLI plugins from them.
+- **Remote daemon warnings.** `DOCKER_HOST` and `DOCKER_CONTEXT` are reported
+  when they may target a remote daemon. Root runs refuse an unsafe `PATH`,
+  `DOCKER_CONFIG`, or `HOME/.docker` path as described above.
 - **Deterministic project selection.** Compose child processes inherit the
   Docker environment but have `COMPOSE_PROJECT_NAME`, `COMPOSE_FILE`,
   `COMPOSE_PROFILES`, and `COMPOSE_ENV_FILES` cleared. Project names are passed
@@ -485,16 +511,17 @@ Full details and a threat model are in [SECURITY.md](SECURITY.md). Key controls:
   the audit log cannot be written.
 - **Host-wide lock.** A non-blocking `flock` prevents two operators from running
   mutating operations at the same time.
-- **Root file-trust checks.** Before a project-scoped mutation, root-run
-  Compose files, the automatically loaded project `.env`, service `env_file`
-  paths, build contexts, build Dockerfiles, and local Compose `secrets`/`configs`
-  files are checked. If any path or parent directory is owned by a non-root user
-  or is group/world-writable (except sticky root-owned directories such as
-  `/tmp`), the action is blocked. Otherwise a local user
-  could modify a file and get root through a container. Compose `include` and
-  service `extends` references cannot be fully enumerated without a YAML
-  parser; the tool warns when they are present, and the entire project tree
-  should remain root-controlled.
+- **File-trust checks.** Before a project-scoped mutation, Compose files
+  (including standard overrides), the automatically loaded project `.env`,
+  service `env_file` paths, build contexts, build Dockerfiles, and local Compose
+  `secrets`/`configs` files are checked. A path and its parent chain must be
+  owned by root or the current user and must not be group/world-writable (sticky
+  root-owned directories such as `/tmp` are tolerated). Otherwise a local user
+  could modify a file and leverage Docker access. Build context directories and
+  Dockerfiles are checked, but the entire build-context tree is not recursively
+  verified; keep it controlled by root/current user. Projects using Compose
+  `include` or service `extends` are blocked by default because their referenced
+  files cannot be fully enumerated without a YAML parser.
 - **High-risk confirmation.** Privileged containers, host network/PID/IPC/user
   namespaces, Docker socket mounts, dangerous capabilities, disabled
   seccomp/AppArmor, and sensitive host mounts are shown and require confirmation
@@ -549,6 +576,8 @@ Tests cover:
 - Config parsing and permission-related behaviour.
 - Audit logging, symlink refusal, log permissions, and lock exclusivity.
 - Menu table/filter/confirmation logic.
+- Large command output, standard override inclusion, unverified-reference
+  blocking, non-root file ownership, and Docker-binary path hardening.
 - End-to-end CLI commands against a fake `docker` executable, including scans,
   update checks, `up -d`, audit, prune, logs, and doctor.
 
@@ -587,14 +616,21 @@ Before applying updates to production, verify that:
 | `up` fails with `unknown flag: --pull` | Upgrade Docker Compose; apply actions use `--pull never` to prevent silent pulls. |
 | `Audit log unavailable` | Fix the audit path permissions/ownership; mutating actions are disabled by design. |
 | `refusing to load ... not root-controlled` | `chown root:root` the file and its parent directories; remove group/world write. |
+| `refusing to load ... not controlled by root or the current user` | Make the config owned by root/you and remove group/world write. |
+| `refusing to execute a docker binary from an unsafe path` | Install Docker in a root-controlled location such as `/usr/bin` or `/usr/local/bin`; remove user-writable directories from root's `PATH`. |
+| `refusing to run with a root environment that is not root-controlled` | Remove user-writable directories from root's `PATH`; keep `DOCKER_CONFIG`/`HOME/.docker` root-owned and non-writable. |
+| `docker-mgmt is running as root from a path that is not fully root-controlled` | Copy/install the tool into a root-owned directory such as `/opt/docker-mgmt`; do not `sudo` a user-writable checkout in production. |
+| Project blocked for `include`/`extends` | Review every referenced file, keep the project tree root/current-user controlled, then set `security.allow_unverified_references=true` only if you accept the risk. |
 | `refusing to load symlinked config ... as root` | Replace the symlink with a root-owned regular file (for example, copy the target to `/etc/docker-mgmt/config.ini`). |
 | Project marked blocked | Two Compose files share a project name, or a running project has different config files. Give each a unique `name:` or separate directories. |
-| Root file-trust issues | `chown -R root:root` the Compose project and `chmod 0644` files; check `.env` and build contexts. Do not enable `allow_unsafe_ownership` on production unless you accept the risk. |
+| File-trust issues | Make the project owned by root or your user, and `chmod 0644` files; check `.env`, overrides, and build contexts. Do not enable `allow_unsafe_ownership` on production unless you accept the risk. |
 | No projects found | Check `scan.roots`, `max_depth`, hidden dirs, and file names; try `--root /path --all-yaml`. |
 | `another docker-mgmt operation holds ...` | Wait for the other operation or inspect the lock owner; the lock is non-blocking by design. |
 | Pull fails with auth errors | Run `docker login` in the same user context; check registry/credential helper configuration. |
 | Scan is slow | Reduce roots/depth, keep `include_all_yaml=false`, and exclude large directories. |
 | `DOCKER_HOST is set` warning | Unset it for a local daemon, or confirm the remote daemon is the intended target. |
+| `DOCKER_CONTEXT` warning | Verify the active Docker context is local (`docker context show`); remote contexts are root-equivalent too. |
+| `DOCKER_CONFIG` / `HOME/.docker` warning | Make the Docker config directory owned by root/you and not group/world-writable, or unset the variable. |
 
 ## Repository layout
 
@@ -637,8 +673,14 @@ pyproject.toml              optional PEP 517 packaging, zero runtime deps
 - Compose files can run arbitrary commands and mount host paths by design. The
   tool validates and warns, but it cannot make a malicious Compose file safe.
 - Compose `include`/`extends` files are not individually enumerated for trust
-  checks. A warning is shown; keep the entire project tree root-owned and
-  non-writable.
+  checks. Projects using them are blocked from mutating actions by default;
+  `security.allow_unverified_references=true` is an explicit override.
+- Build-context contents are not recursively trust-checked. The context
+  directory and Dockerfile are checked; keep every file in the context owned by
+  root/current user and non-writable by others.
+- Trust checks use POSIX owner/mode bits, not POSIX ACLs, SELinux labels,
+  mount options, or immutable attributes. Verify those separately on hosts that
+  use them.
 - Image updates are detected by pulling tags. If an upstream registry changes an
   image under the same tag and digest, or you use a digest pin, there may be
   nothing to detect.
@@ -646,3 +688,14 @@ pyproject.toml              optional PEP 517 packaging, zero runtime deps
   it to a remote log collector if you need stronger guarantees.
 - No notifications are sent. `check --json` is designed to be consumed by an
   external monitoring system.
+
+---
+
+## Development note
+
+This project was developed with AI assistance and human review. The maintainer
+defines the requirements, threat model, edge cases and acceptance criteria; AI
+helps write and refactor code; the maintainer tests, breaks and verifies it.
+The software is provided as-is, without warranty. See
+[How this was built](https://apps.bergling.net/how-this-was-built/) for the
+longer explanation.
