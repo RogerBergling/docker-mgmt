@@ -40,6 +40,7 @@ class ComposeProject:
     build_contexts: tuple[Path, ...] = ()
     extra_files: tuple[Path, ...] = ()
     source: str = "scan"
+    unverified_references: bool = False
     blockers: list[str] = field(default_factory=list)
 
     @property

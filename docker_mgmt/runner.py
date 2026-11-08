@@ -50,6 +50,10 @@ class CommandResult:
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+# Captured command output can be large (for example, a resolved Compose
+# model). Keep a generous safety cap instead of truncating every result to a
+# terminal-sized string.
+MAX_CAPTURE_CHARS = 16 * 1024 * 1024
 _SECRET_RE = re.compile(
     r"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|authorization|auth)"
     r"(\s*[:=]\s*)([^\s,;]+)"
@@ -61,15 +65,15 @@ _PRIVATE_KEY_RE = re.compile(
 )
 
 
-def sanitize_text(text: str, max_length: int = 4000) -> str:
-    """Remove terminal control sequences and cap the size of untrusted output."""
+def sanitize_text(text: str, max_length: Optional[int] = 4000) -> str:
+    """Remove terminal control sequences and optionally cap untrusted output."""
 
     text = _ANSI_RE.sub("", text or "")
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = "".join(
         char for char in text if char in "\n\t" or ord(char) >= 32
     )
-    if len(text) > max_length:
+    if max_length is not None and len(text) > max_length:
         text = text[:max_length] + "\n[output truncated]"
     return text
 
@@ -102,7 +106,9 @@ def summarize_output(result: CommandResult, max_length: int = 800) -> str:
 def format_command(argv: Sequence[str]) -> str:
     """Render a command for display without invoking a shell."""
 
-    return redact_text(shlex.join(str(part) for part in argv))
+    return redact_text(
+        sanitize_text(shlex.join(str(part) for part in argv), max_length=2000)
+    )
 
 
 class CommandRunner:
@@ -148,6 +154,7 @@ class CommandRunner:
                 cwd=str(cwd) if cwd else None,
                 env=self._env(env),
                 input=input_text,
+                stdin=subprocess.DEVNULL if input_text is None else None,
                 stdout=subprocess.PIPE if capture else None,
                 stderr=subprocess.PIPE if capture else None,
                 text=True,
@@ -170,9 +177,10 @@ class CommandRunner:
             result = CommandResult(
                 argv=cmd,
                 returncode=124,
-                stdout=sanitize_text(stdout),
+                stdout=sanitize_text(stdout, max_length=MAX_CAPTURE_CHARS),
                 stderr=sanitize_text(
-                    (stderr + f"\ntimed out after {timeout} seconds").strip()
+                    (stderr + f"\ntimed out after {timeout} seconds").strip(),
+                    max_length=MAX_CAPTURE_CHARS,
                 ),
                 duration_seconds=time.monotonic() - started,
                 timed_out=True,
@@ -184,8 +192,12 @@ class CommandRunner:
         result = CommandResult(
             argv=cmd,
             returncode=completed.returncode,
-            stdout=sanitize_text(completed.stdout or ""),
-            stderr=sanitize_text(completed.stderr or ""),
+            stdout=sanitize_text(
+                completed.stdout or "", max_length=MAX_CAPTURE_CHARS
+            ),
+            stderr=sanitize_text(
+                completed.stderr or "", max_length=MAX_CAPTURE_CHARS
+            ),
             duration_seconds=time.monotonic() - started,
         )
         if check and not result.ok:

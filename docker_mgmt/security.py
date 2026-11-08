@@ -4,10 +4,10 @@ Two separate concerns are handled here:
 
 1. Static review of the resolved Compose model (privileged containers, host
    namespaces, Docker socket mounts, mutable image tags, wildcard ports, ...).
-2. Trust of the files that root will read before running `compose up`. If a
-   non-root user can change a Compose file, .env file, or build context, that
-   user can often obtain root through a container. Such projects are blocked
-   from mutating actions unless the operator explicitly opts out.
+2. Trust of the files that a Docker-privileged run will consume before
+   `compose up`. If another local user can change a Compose file, .env file, or
+   build context, that user can leverage Docker access. Such projects are
+   blocked from mutating actions unless the operator explicitly opts out.
 """
 
 from __future__ import annotations
@@ -219,6 +219,13 @@ def analyze_compose(data: dict[str, object], project_dir: Path) -> ComposeAnalys
                 dockerfile = _build_dockerfile(service, context)
                 if dockerfile is not None and dockerfile not in extra_files:
                     extra_files.append(dockerfile)
+                message = (
+                    f"{name}: build context contents are not recursively "
+                    "trust-checked; keep the whole context controlled by "
+                    "root/current user"
+                )
+                info.warnings.append(message)
+                _append_unique(result.warnings, message)
             else:
                 message = (
                     f"{name}: build context is remote or unresolved and cannot be "
@@ -348,44 +355,62 @@ def _path_chain(path: Path) -> list[Path]:
 
 
 def check_path_trust(path: Path, *, euid: Optional[int] = None) -> list[str]:
-    """Return trust problems for a file/directory that root will consume."""
+    """Return trust problems for a file/directory a Docker-privileged run consumes.
+
+    Docker access is root-equivalent even when the operator is only in the
+    docker group. Therefore a file is trusted only if it is owned by root or the
+    current user and no component is group/world-writable. Sticky root-owned
+    directories such as /tmp are tolerated because non-owners cannot remove a
+    root-owned entry there.
+    """
 
     euid = os.geteuid() if euid is None else euid
+    allowed_owners = {0, euid}
     issues: list[str] = []
     seen: set[tuple[str, str]] = set()
+    target = path.expanduser()
+    if not target.is_absolute():
+        target = Path.cwd() / target
+    try:
+        target_resolved = target.resolve(strict=False)
+    except (OSError, RuntimeError):
+        target_resolved = target
+    target_candidates = {target, target_resolved}
     for item in _path_chain(path):
         try:
             stat = item.stat()
         except OSError:
-            if item == path:
+            if item in target_candidates:
                 issues.append(f"{item} does not exist or is not readable")
             continue
-        if euid == 0:
-            if stat.st_uid != 0:
-                key = (str(item), "owner")
-                if key not in seen:
-                    seen.add(key)
+        if stat.st_uid not in allowed_owners:
+            key = (str(item), "owner")
+            if key not in seen:
+                seen.add(key)
+                issues.append(
+                    f"{item} is owned by uid {stat.st_uid}; root or current-user "
+                    "ownership is required"
+                )
+        if stat.st_mode & 0o022:
+            is_dir = stat_module.S_ISDIR(stat.st_mode)
+            sticky = bool(stat.st_mode & 0o1000)
+            # A sticky parent such as /tmp is acceptable for a file because
+            # non-owners cannot remove a root/current-user-owned entry there.
+            # A sticky directory used *as the target* (for example a shared
+            # build context) is writable by others and is not trusted.
+            if is_dir and sticky and item not in target_candidates:
+                continue
+            key = (str(item), "mode")
+            if key not in seen:
+                seen.add(key)
+                if is_dir and sticky:
                     issues.append(
-                        f"{item} is owned by uid {stat.st_uid}; root ownership is required"
+                        f"{item} is a sticky group/world-writable target directory "
+                        f"(mode {stat.st_mode & 0o777:04o})"
                     )
-            if stat.st_mode & 0o022 and not (
-                stat_module.S_ISDIR(stat.st_mode) and stat.st_mode & 0o1000
-            ):
-                key = (str(item), "mode")
-                if key not in seen:
-                    seen.add(key)
+                else:
                     issues.append(
                         f"{item} is group/world-writable (mode {stat.st_mode & 0o777:04o})"
-                    )
-        else:
-            if stat.st_mode & 0o002 and not (
-                stat_module.S_ISDIR(stat.st_mode) and stat.st_mode & 0o1000
-            ):
-                key = (str(item), "world-writable")
-                if key not in seen:
-                    seen.add(key)
-                    issues.append(
-                        f"{item} is world-writable (mode {stat.st_mode & 0o777:04o})"
                     )
     return issues
 
@@ -408,6 +433,39 @@ def check_project_trust(
                 seen.add(issue)
                 issues.append(issue)
     return issues
+
+
+def installation_warnings(*, euid: Optional[int] = None) -> list[str]:
+    """Warn when a root run uses code from a non-root-controlled checkout.
+
+    The check cannot protect an already-compromised process, but it avoids the
+    common mistake of running `sudo ./docker-mgmt` from a user-writable home
+    directory in production.
+    """
+
+    euid = os.geteuid() if euid is None else euid
+    if euid != 0:
+        return []
+    package_dir = Path(__file__).resolve().parent
+    paths = [package_dir, *sorted(package_dir.glob("*.py"))]
+    wrapper = package_dir.parent / "docker-mgmt"
+    if wrapper.exists():
+        paths.append(wrapper)
+    issues: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        for issue in check_path_trust(path, euid=0):
+            if issue not in seen:
+                seen.add(issue)
+                issues.append(issue)
+    if not issues:
+        return []
+    return [
+        "docker-mgmt is running as root from a path that is not fully "
+        "root-controlled; a local user could modify code executed as root. "
+        "Install or copy it to a root-owned directory (for example "
+        "/opt/docker-mgmt) and run it from there."
+    ] + issues[:5]
 
 
 def collect_all_warnings(projects: Iterable[object]) -> list[str]:

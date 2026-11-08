@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import configparser
 import os
+import stat as stat_module
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -68,7 +69,7 @@ _KNOWN_KEYS: dict[str, set[str]] = {
     },
     "audit": {"path", "max_bytes"},
     "ui": {"color", "page_size"},
-    "security": {"allow_unsafe_ownership"},
+    "security": {"allow_unsafe_ownership", "allow_unverified_references"},
 }
 
 
@@ -91,6 +92,7 @@ class Config:
     color: bool = True
     page_size: int = 20
     allow_unsafe_ownership: bool = False
+    allow_unverified_references: bool = False
     warnings: tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -120,6 +122,7 @@ class Config:
             "color": self.color,
             "page_size": self.page_size,
             "allow_unsafe_ownership": self.allow_unsafe_ownership,
+            "allow_unverified_references": self.allow_unverified_references,
             "warnings": list(self.warnings),
         }
 
@@ -169,51 +172,55 @@ def _resolve_config_candidate(explicit: Optional[str]) -> tuple[Optional[Path], 
     return None, False
 
 
-def _check_config_permissions(path: Path, warnings: list[str]) -> None:
+def _check_config_permissions(path: Path) -> None:
     euid = os.geteuid()
     if euid == 0 and path.is_symlink():
         raise ConfigError(
             f"refusing to load symlinked config {path} as root; use a root-owned "
             "regular file so a writable parent cannot redirect configuration"
         )
-    resolved = path.resolve()
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ConfigError(f"cannot resolve config path {path}: {exc}") from exc
     try:
         stat = resolved.stat()
     except OSError as exc:
         raise ConfigError(f"cannot stat config file {resolved}: {exc}") from exc
+    if not stat_module.S_ISREG(stat.st_mode):
+        raise ConfigError(f"config path is not a regular file: {resolved}")
 
-    if euid == 0:
-        for parent in resolved.parents:
-            try:
-                parent_stat = parent.stat()
-            except OSError as exc:
-                raise ConfigError(
-                    f"cannot stat config directory {parent}: {exc}"
-                ) from exc
-            mode = parent_stat.st_mode
-            sticky_world_writable = bool(
-                (mode & 0o1000) and (mode & 0o022)
-            )
-            if parent_stat.st_uid != 0 or (mode & 0o022 and not sticky_world_writable):
-                raise ConfigError(
-                    f"refusing to load {resolved}: config directory {parent} is not "
-                    "root-controlled (must be owned by root and not group/world-writable)"
-                )
-        if stat.st_uid != 0:
+    # A config file is a control input for a Docker-privileged process. Whether
+    # we run as root or as a user with Docker access, another local user who can
+    # modify it can redirect the tool to attacker-controlled Compose files.
+    allowed_owners = {0, euid}
+    for parent in resolved.parents:
+        try:
+            parent_stat = parent.stat()
+        except OSError as exc:
             raise ConfigError(
-                f"refusing to load {resolved}: it is owned by uid {stat.st_uid}, "
-                "not root. A non-root user could change what this root-run tool "
-                "executes. Run `chown root:root` on the file."
-            )
-        if stat.st_mode & 0o022:
+                f"cannot stat config directory {parent}: {exc}"
+            ) from exc
+        mode = parent_stat.st_mode
+        sticky_world_writable = bool((mode & 0o1000) and (mode & 0o022))
+        if (
+            parent_stat.st_uid not in allowed_owners
+            or (mode & 0o022 and not sticky_world_writable)
+        ):
             raise ConfigError(
-                f"refusing to load {resolved}: it is group- or world-writable "
-                f"(mode {stat.st_mode & 0o777:04o}). Run `chmod 0644` on it."
+                f"refusing to load {resolved}: config directory {parent} is not "
+                "controlled by root or the current user, or is group/world-writable"
             )
-    elif stat.st_mode & 0o002:
-        warnings.append(
-            f"config file {resolved} is world-writable; another local user can "
-            "change scan roots used by this tool"
+    if stat.st_uid not in allowed_owners:
+        raise ConfigError(
+            f"refusing to load {resolved}: it is owned by uid {stat.st_uid}, "
+            "not root or the current user. Another user could change what this "
+            "Docker-privileged tool executes."
+        )
+    if stat.st_mode & 0o022:
+        raise ConfigError(
+            f"refusing to load {resolved}: it is group- or world-writable "
+            f"(mode {stat.st_mode & 0o777:04o}). Run `chmod 0644` on it."
         )
 
 
@@ -309,7 +316,7 @@ def load_config(
     parser.optionxform = str.lower  # type: ignore[assignment]
 
     if path is not None and path.exists():
-        _check_config_permissions(path, warnings)
+        _check_config_permissions(path)
         try:
             with path.open("r", encoding="utf-8") as handle:
                 parser.read_file(handle)
@@ -452,10 +459,21 @@ def load_config(
         default=False,
         warnings=warnings,
     )
+    allow_unverified_references = _parse_bool(
+        _get(parser, "security", "allow_unverified_references", "false"),
+        name="security.allow_unverified_references",
+        default=False,
+        warnings=warnings,
+    )
     if allow_unsafe_ownership:
         warnings.append(
             "security.allow_unsafe_ownership is enabled; Compose files, .env "
-            "files or build contexts owned by non-root users will be accepted"
+            "files or build contexts not controlled by root/current user will be accepted"
+        )
+    if allow_unverified_references:
+        warnings.append(
+            "security.allow_unverified_references is enabled; include/extends "
+            "files are not individually trust-checked"
         )
 
     return Config(
@@ -476,5 +494,6 @@ def load_config(
         color=color,
         page_size=page_size,
         allow_unsafe_ownership=allow_unsafe_ownership,
+        allow_unverified_references=allow_unverified_references,
         warnings=tuple(warnings),
     )

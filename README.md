@@ -439,11 +439,14 @@ while `1` means "errors occurred and the result may be incomplete".
 
 `check` does this for each project:
 
-1. Records the local image ID for every service image.
-2. Runs `docker compose pull --quiet --ignore-buildable`.
-3. Records the local image ID again.
-4. Records the image IDs of running containers for the project.
-5. Compares them.
+1. Runs a non-interactive pull preflight: project validity, blockers, unverified `include`/`extends` references, and file-trust checks.
+2. Records the local image ID for every service image.
+3. Runs `docker compose pull --quiet --ignore-buildable`.
+4. Records the local image ID again.
+5. Records the image IDs of running containers for the project.
+6. Compares them.
+
+A project that fails the preflight is skipped with an error unless `security.allow_unsafe_ownership` (for file-trust issues) or `security.allow_unverified_references` (for `include`/`extends`) is explicitly enabled; in those cases the check prints a warning and continues. High-risk Compose settings only produce a warning for `check`, because pulling does not recreate containers. `check` never runs `compose up -d`.
 
 Service statuses:
 
@@ -511,17 +514,20 @@ Full details and a threat model are in [SECURITY.md](SECURITY.md). Key controls:
   the audit log cannot be written.
 - **Host-wide lock.** A non-blocking `flock` prevents two operators from running
   mutating operations at the same time.
-- **File-trust checks.** Before a project-scoped mutation, Compose files
-  (including standard overrides), the automatically loaded project `.env`,
-  service `env_file` paths, build contexts, build Dockerfiles, and local Compose
-  `secrets`/`configs` files are checked. A path and its parent chain must be
-  owned by root or the current user and must not be group/world-writable (sticky
-  root-owned directories such as `/tmp` are tolerated). Otherwise a local user
-  could modify a file and leverage Docker access. Build context directories and
-  Dockerfiles are checked, but the entire build-context tree is not recursively
-  verified; keep it controlled by root/current user. Projects using Compose
-  `include` or service `extends` are blocked by default because their referenced
-  files cannot be fully enumerated without a YAML parser.
+- **File-trust checks.** Before a project-scoped mutation (including `check`'s
+  image pull), Compose files (including standard overrides), the automatically
+  loaded project `.env`, service `env_file` paths, build contexts, build
+  Dockerfiles, and local Compose `secrets`/`configs` files are checked. A path
+  and its parent chain must be owned by root or the current user and must not be
+  group/world-writable (sticky root-owned parent directories such as `/tmp` are
+  tolerated). A directory used directly as the target (for example a build
+  context) is rejected when it is sticky and group/world-writable, even inside
+  `/tmp`. Otherwise a local user could modify a file and leverage Docker access.
+  Build context directories and Dockerfiles are checked, but the entire
+  build-context tree is not recursively verified; keep it controlled by
+  root/current user. Projects using Compose `include` or service `extends` are
+  blocked by default because their referenced files cannot be fully enumerated
+  without a YAML parser.
 - **High-risk confirmation.** Privileged containers, host network/PID/IPC/user
   namespaces, Docker socket mounts, dangerous capabilities, disabled
   seccomp/AppArmor, and sensitive host mounts are shown and require confirmation

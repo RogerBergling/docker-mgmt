@@ -13,12 +13,18 @@ from docker_mgmt.config import (
 )
 
 
+def _write_secure(path, content: str) -> None:
+    path.write_text(content, encoding="utf-8")
+    path.chmod(0o644)
+
+
 class ConfigTests(unittest.TestCase):
     def test_loads_values_and_extra_excludes(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw)
             config_path = tmp / "config.ini"
-            config_path.write_text(
+            _write_secure(
+                config_path,
                 f"""
 [scan]
 roots = {tmp / "apps"}, {tmp / "srv"}
@@ -46,7 +52,6 @@ page_size = 25
 [security]
 allow_unsafe_ownership = true
 """,
-                encoding="utf-8",
             )
             config = load_config(str(config_path))
             self.assertEqual(config.config_path, config_path)
@@ -72,7 +77,7 @@ allow_unsafe_ownership = true
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw)
             config_path = tmp / "config.ini"
-            config_path.write_text("[scan]\nroots = /one\n", encoding="utf-8")
+            _write_secure(config_path, "[scan]\nroots = /one\n")
             config = load_config(
                 str(config_path),
                 roots_override=["/two"],
@@ -87,7 +92,8 @@ allow_unsafe_ownership = true
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw)
             config_path = tmp / "config.ini"
-            config_path.write_text(
+            _write_secure(
+                config_path,
                 """
 [scan]
 include_all_yaml = maybe
@@ -98,7 +104,6 @@ key = value
 color = rainbow
 page_size = 1
 """,
-                encoding="utf-8",
             )
             config = load_config(str(config_path))
             warnings = "\n".join(config.warnings)
@@ -119,9 +124,9 @@ page_size = 1
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw)
             config_path = tmp / "config.ini"
-            config_path.write_text(
+            _write_secure(
+                config_path,
                 "[scan]\nroots = /opt\n[audit]\npath = logs/audit.log\n",
-                encoding="utf-8",
             )
             config = load_config(str(config_path))
             self.assertEqual(config.audit_path, (tmp / "logs" / "audit.log").resolve())

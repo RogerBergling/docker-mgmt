@@ -18,6 +18,7 @@ from .audit import (
 )
 from .config import Config
 from .discovery import (
+    reference_findings,
     scan_projects,
     summarize_scan,
 )
@@ -28,10 +29,10 @@ from .docker import (
     DockerUnavailable,
 )
 from .models import ComposeProject, Container, ProjectUpdateReport
-from .runner import DockerMgmtError, summarize_output
-from .security import check_project_trust
+from .runner import DockerMgmtError, redact_text, summarize_output
+from .security import check_project_trust, installation_warnings
 from .ui import QuitApp, UI
-from .updates import apply_project, check_project
+from .updates import apply_project, check_project, pull_preflight
 
 
 class App:
@@ -67,15 +68,14 @@ class App:
         )
         self._ensure_audit(quiet=False)
 
-        if os.environ.get("DOCKER_HOST"):
-            self.ui.warn(
-                "DOCKER_HOST is set; actions may target a remote Docker daemon: "
-                + os.environ["DOCKER_HOST"]
-            )
+        for warning in installation_warnings():
+            self.ui.warn(warning)
+        for warning in self.docker.environment_warnings():
+            self.ui.warn(warning)
         if self.config.allow_unsafe_ownership:
             self.ui.warn(
-                "security.allow_unsafe_ownership is enabled: non-root-writable "
-                "Compose files can be used for root Docker operations."
+                "security.allow_unsafe_ownership is enabled: Compose files not "
+                "controlled by root/current user can be used for Docker operations."
             )
 
         try:
@@ -238,8 +238,12 @@ class App:
             )
             self.ui.info(summarize_output(result))  # type: ignore[arg-type]
             return
-        stdout = str(getattr(result, "stdout", "") or "").strip()
-        stderr = str(getattr(result, "stderr", "") or "").strip()
+        stdout = redact_text(str(getattr(result, "stdout", "") or "").strip())
+        stderr = redact_text(str(getattr(result, "stderr", "") or "").strip())
+        if len(stdout) > 8000:
+            stdout = stdout[:8000] + "\n[output truncated]"
+        if len(stderr) > 4000:
+            stderr = stderr[:4000] + "\n[output truncated]"
         if stdout:
             self.ui.info(stdout)
         if stderr:
@@ -266,6 +270,25 @@ class App:
             project.extra_files,
         )
 
+    def _pull_preflight(self, project: ComposeProject) -> bool:
+        """Non-interactive file-trust checks before an image pull."""
+
+        result = pull_preflight(project, self.config)
+        for warning in result.warnings:
+            self.ui.warn(warning)
+        if not result.ok:
+            self.ui.error(
+                f"Cannot pull images for {project.project_name}: preflight failed."
+            )
+            self.ui.bullets(result.errors)
+            if not self.config.allow_unsafe_ownership:
+                self.ui.info(
+                    "Fix ownership/permissions on the listed files, or set "
+                    "security.allow_unsafe_ownership=true only if you accept the risk."
+                )
+            return False
+        return True
+
     def _preflight(
         self,
         project: ComposeProject,
@@ -280,6 +303,39 @@ class App:
             self.ui.error(f"Cannot {action}: project has unresolved blockers.")
             self.ui.bullets(project.blockers)
             return False
+        reference_warnings, unverified_now = reference_findings(project.files)
+        if unverified_now and not project.unverified_references:
+            project.unverified_references = True
+            for warning in reference_warnings:
+                if warning not in project.warnings:
+                    project.warnings.append(warning)
+        if project.unverified_references:
+            if not self.config.allow_unverified_references:
+                self.ui.error(
+                    f"Cannot {action}: the Compose project uses include/extends "
+                    "references that cannot be individually trust-checked."
+                )
+                self.ui.bullets(
+                    [
+                        warning
+                        for warning in project.warnings
+                        if "include" in warning or "extends" in warning
+                    ]
+                )
+                self.ui.info(
+                    "Keep the entire project tree controlled by root/current "
+                    "user, or set security.allow_unverified_references=true "
+                    "only after reviewing every referenced file."
+                )
+                return False
+            self.ui.warn(
+                "include/extends references are allowed by configuration; "
+                "their referenced files are not individually trust-checked."
+            )
+            if not self.ui.confirm(
+                "Continue despite unverified Compose references?", default=False
+            ):
+                return False
         if not self._require_audit():
             return False
 
@@ -299,13 +355,15 @@ class App:
         if trust:
             if not self.config.allow_unsafe_ownership:
                 self.ui.error(
-                    "Blocked: files used by this project are not root-controlled."
+                    "Blocked: files used by this project are not controlled by "
+                    "root/current user."
                 )
                 self.ui.bullets(trust)
                 self.ui.info(
-                    "A non-root user able to edit these files could obtain root "
-                    "through a container. Fix ownership/permissions (for example "
-                    "`chown -R root:root` and `chmod 0644` on the files), or set "
+                    "Another local user able to edit these files could leverage "
+                    "Docker access. Fix ownership/permissions (for example "
+                    "`chown -R root:root` and `chmod 0644` on the files, or use "
+                    "your own user as owner), or set "
                     "security.allow_unsafe_ownership=true only if you accept that risk."
                 )
                 return False
@@ -314,7 +372,8 @@ class App:
             )
             self.ui.bullets(trust)
             if not self.ui.confirm(
-                "Continue despite non-root-writable project files?", default=False
+                "Continue despite project files not controlled by root/current user?",
+                default=False,
             ):
                 return False
 
@@ -560,7 +619,8 @@ class App:
                     ("High-risk warnings", len(project.critical_warnings)),
                     ("Security warnings", len(project.warnings)),
                     ("Blockers", len(project.blockers)),
-                    ("Root trust issues", len(trust)),
+                    ("Unverified references", "yes" if project.unverified_references else "no"),
+                    ("File-trust issues", len(trust)),
                 ]
             )
             if project.services:
@@ -607,7 +667,7 @@ class App:
                 if len(project.warnings) > 20:
                     self.ui.dim(f"  ... and {len(project.warnings) - 20} more")
             if trust:
-                self.ui.section("Root file-trust issues")
+                self.ui.section("File-trust issues")
                 self.ui.bullets(trust)
                 if not self.config.allow_unsafe_ownership:
                     self.ui.warn(
@@ -662,6 +722,8 @@ class App:
     ) -> None:
         if not project.valid:
             self.ui.error(f"Cannot check: {project.error or 'invalid project'}")
+            return
+        if not self._pull_preflight(project):
             return
         if not self._require_audit():
             return
@@ -952,7 +1014,9 @@ class App:
         project.error = None
         project.project_name = metadata.project_name
         project.services = list(metadata.analysis.services)
-        project.warnings = list(metadata.analysis.warnings)
+        reference_warnings, unverified_references = reference_findings(project.files)
+        project.warnings = list(metadata.analysis.warnings) + reference_warnings
+        project.unverified_references = unverified_references
         project.critical_warnings = list(metadata.analysis.critical_warnings)
         project.env_files = metadata.analysis.env_files
         project.build_contexts = metadata.analysis.build_contexts
@@ -972,7 +1036,7 @@ class App:
                 ("Files", ", ".join(str(path) for path in project.files)),
                 ("High-risk findings", len(project.critical_warnings)),
                 ("Warnings", len(project.warnings)),
-                ("Root trust issues", len(trust)),
+                ("File-trust issues", len(trust)),
                 (
                     "Unsafe ownership allowed",
                     "YES (dangerous)" if self.config.allow_unsafe_ownership else "no",
@@ -986,7 +1050,7 @@ class App:
             self.ui.section("Warnings")
             self.ui.bullets(project.warnings)
         if trust:
-            self.ui.section("Root file-trust issues")
+            self.ui.section("File-trust issues")
             self.ui.bullets(trust)
         if not (project.critical_warnings or project.warnings or trust):
             self.ui.success("No static findings from the configured checks.")
@@ -998,7 +1062,8 @@ class App:
                 "disabled seccomp/AppArmor sandboxes and host devices",
                 "floating image tags (latest/stable/main/...)",
                 "ports published on all host interfaces",
-                "root ownership and writability of Compose/.env/build-context files",
+                "root/current-user ownership and writability of Compose, .env, "
+                "and build-context files",
             ]
         )
         self.ui.pause()
@@ -1386,7 +1451,7 @@ class App:
                     lines = result.stdout.strip().splitlines()
                     self.ui.section(f"Volumes ({len(lines)})")
                     for line in lines:
-                        self.ui.info("  " + line)
+                        self.ui.info("  " + redact_text(line))
                     if not lines:
                         self.ui.info("  (none)")
                 else:
@@ -1479,6 +1544,7 @@ class App:
         invalid: list[ComposeProject] = []
         critical: list[ComposeProject] = []
         blocked: list[ComposeProject] = []
+        unverified: list[ComposeProject] = []
         for project in self.projects:
             rows.append(
                 [
@@ -1488,6 +1554,7 @@ class App:
                     len(project.critical_warnings),
                     len(project.warnings),
                     len(project.blockers),
+                    "yes" if project.unverified_references else "no",
                     project.primary_file,
                 ]
             )
@@ -1497,11 +1564,22 @@ class App:
                 critical.append(project)
             if project.blockers:
                 blocked.append(project)
+            if project.unverified_references:
+                unverified.append(project)
         if rows:
             self.ui.print_table(
-                ["PROJECT", "VALID", "SERVICES", "HIGH-RISK", "WARNINGS", "BLOCKERS", "FILE"],
+                [
+                    "PROJECT",
+                    "VALID",
+                    "SERVICES",
+                    "HIGH-RISK",
+                    "WARNINGS",
+                    "BLOCKERS",
+                    "UNVERIFIED",
+                    "FILE",
+                ],
                 rows,
-                max_widths=[20, 7, 9, 10, 9, 9, 56],
+                max_widths=[20, 7, 9, 10, 9, 9, 10, 56],
             )
         else:
             self.ui.info("No projects discovered.")
@@ -1519,6 +1597,18 @@ class App:
             for project in blocked:
                 self.ui.info(f"  {project.project_name}:")
                 self.ui.bullets(project.blockers, prefix="    - ")
+        if unverified:
+            self.ui.section("Unverified include/extends references")
+            for project in unverified:
+                self.ui.info(f"  {project.project_name}:")
+                self.ui.bullets(
+                    [
+                        warning
+                        for warning in project.warnings
+                        if "include" in warning or "extends" in warning
+                    ],
+                    prefix="    - ",
+                )
         trust = [
             (project, self._trust_issues(project))
             for project in self.projects
@@ -1526,7 +1616,7 @@ class App:
         ]
         trust = [(project, issues) for project, issues in trust if issues]
         if trust:
-            self.ui.section("Root file-trust issues")
+            self.ui.section("File-trust issues")
             for project, issues in trust:
                 self.ui.info(f"  {project.project_name}:")
                 self.ui.bullets(issues, prefix="    - ")
@@ -1599,7 +1689,13 @@ class App:
                 ("Audit log", self.config.audit_path),
                 ("Operation lock", self.config.lock_path),
                 ("DOCKER_HOST", os.environ.get("DOCKER_HOST", "(local socket)")),
+                ("DOCKER_CONTEXT", os.environ.get("DOCKER_CONTEXT", "(default)")),
+                ("DOCKER_CONFIG", os.environ.get("DOCKER_CONFIG", "(default)")),
                 ("Allow unsafe ownership", self.config.allow_unsafe_ownership),
+                (
+                    "Allow unverified references",
+                    self.config.allow_unverified_references,
+                ),
                 ("Docker", self.docker.version_info()),
                 ("Compose", self.docker.compose_version_string()),
             ]

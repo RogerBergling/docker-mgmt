@@ -34,12 +34,13 @@ from .docker import (
     DockerUnavailable,
 )
 from .models import ComposeProject, ProjectUpdateReport
-from .runner import CommandRunner, DockerMgmtError, summarize_output
-from .security import check_project_trust
+from .runner import CommandRunner, DockerMgmtError, redact_text, summarize_output
+from .security import check_project_trust, installation_warnings
 from .ui import UI
 from .updates import (
     check_exit_code,
     check_project,
+    pull_preflight,
     report_to_dict,
 )
 
@@ -400,6 +401,28 @@ def command_check(
     try:
         with OperationLock(config.lock_path):
             for project in selected:
+                preflight = pull_preflight(project, config)
+                for warning in preflight.warnings:
+                    print(
+                        f"warning: {project.project_name}: {warning}",
+                        file=sys.stderr,
+                    )
+                if not preflight.ok:
+                    print(
+                        f"error: {project.project_name}: pull preflight failed:",
+                        file=sys.stderr,
+                    )
+                    for error in preflight.errors:
+                        print(f"  - {error}", file=sys.stderr)
+                    reports.append(
+                        ProjectUpdateReport(
+                            project=project,
+                            skipped_reason="pull preflight failed: "
+                            + "; ".join(preflight.errors),
+                            skipped_error=True,
+                        )
+                    )
+                    continue
                 started = time.monotonic()
                 report = check_project(
                     docker, project, containers, progress=progress
@@ -505,6 +528,22 @@ def command_update(
             )
             failures += 1
             continue
+        if project.unverified_references and not config.allow_unverified_references:
+            print(
+                f"error: {project.project_name}: include/extends references are "
+                "not individually trust-checked; keep the project tree "
+                "root/current-user controlled or set "
+                "security.allow_unverified_references=true after review",
+                file=sys.stderr,
+            )
+            failures += 1
+            continue
+        if project.unverified_references:
+            print(
+                f"warning: {project.project_name}: include/extends references "
+                "are allowed by configuration but are not individually trust-checked",
+                file=sys.stderr,
+            )
         trust = check_project_trust(
             project.files,
             project.env_files,
@@ -513,13 +552,22 @@ def command_update(
         )
         if trust and not config.allow_unsafe_ownership:
             print(
-                f"error: {project.project_name}: files are not root-controlled:",
+                f"error: {project.project_name}: files are not controlled by "
+                "root/current user:",
                 file=sys.stderr,
             )
             for issue in trust:
                 print(f"  - {issue}", file=sys.stderr)
             failures += 1
             continue
+        if trust:
+            print(
+                f"warning: {project.project_name}: unsafe file ownership is "
+                "allowed by configuration:",
+                file=sys.stderr,
+            )
+            for issue in trust:
+                print(f"  - {issue}", file=sys.stderr)
         if project.critical_warnings:
             print(
                 f"warning: {project.project_name}: high-risk settings:",
@@ -625,7 +673,16 @@ def command_validate(
         ui = _ui(config)
         ui.header("Compose validation")
         ui.print_table(
-            ["PROJECT", "VALID", "SERVICES", "HIGH-RISK", "WARNINGS", "BLOCKERS", "FILE"],
+            [
+                "PROJECT",
+                "VALID",
+                "SERVICES",
+                "HIGH-RISK",
+                "WARNINGS",
+                "BLOCKERS",
+                "UNVERIFIED",
+                "FILE",
+            ],
             [
                 [
                     project.project_name,
@@ -634,11 +691,12 @@ def command_validate(
                     len(project.critical_warnings),
                     len(project.warnings),
                     len(project.blockers),
+                    "yes" if project.unverified_references else "no",
                     project.primary_file,
                 ]
                 for project in result.projects
             ],
-            max_widths=[20, 7, 9, 10, 9, 9, 56],
+            max_widths=[20, 7, 9, 10, 9, 9, 10, 56],
         )
         for project in result.projects:
             if project.valid and not (
@@ -663,6 +721,11 @@ def command_validate(
 
     invalid = [p for p in result.projects if not p.valid]
     risky = [p for p in result.projects if p.critical_warnings or p.blockers]
+    unverified = [
+        p
+        for p in result.projects
+        if p.unverified_references and not config.allow_unverified_references
+    ]
     trust = [
         p
         for p in result.projects
@@ -672,7 +735,7 @@ def command_validate(
         )
         and not config.allow_unsafe_ownership
     ]
-    return 1 if invalid or risky or trust else 0
+    return 1 if invalid or risky or trust or unverified else 0
 
 
 def command_prune(
@@ -726,7 +789,7 @@ def command_prune(
         print(f"error: prune failed: {summarize_output(result)}", file=sys.stderr)
         return 1
     ui.header("Prune result")
-    ui.info(result.stdout.strip() or "done")
+    ui.info(redact_text(result.stdout.strip()) or "done")
     after = docker.system_df()
     if after.ok:
         ui.header("Disk usage after cleanup")
@@ -888,11 +951,14 @@ def command_doctor(
             ("Docker daemon", "ok" if docker_ok else "unavailable"),
             ("Docker Compose", docker.compose_version_string() if compose_ok else "unavailable"),
             ("DOCKER_HOST", os.environ.get("DOCKER_HOST", "(local socket)")),
+            ("DOCKER_CONTEXT", os.environ.get("DOCKER_CONTEXT", "(default)")),
+            ("DOCKER_CONFIG", os.environ.get("DOCKER_CONFIG", "(default)")),
             ("Audit log", f"{config.audit_path} ({'writable' if audit_ok else 'NOT WRITABLE'})"),
             ("Lock file", f"{config.lock_path} ({lock_status})"),
             ("Scan roots", ", ".join(roots)),
             ("Candidate YAML files", len(candidates)),
             ("Allow unsafe ownership", config.allow_unsafe_ownership),
+            ("Allow unverified references", config.allow_unverified_references),
         ]
     )
     if config.warnings:
@@ -909,7 +975,8 @@ def command_doctor(
         [
             "Updates are pull-on-demand; no automatic restart/update daemon is used.",
             "Mutating actions require the audit log to be writable.",
-            "Root-run Compose actions require root-owned, non-writable files.",
+            "Docker-privileged Compose actions require root/current-user-owned, "
+            "non-writable files.",
             "Volumes are never pruned and `docker compose down -v` is never used.",
             "Docker access is root-equivalent; restrict who can run this tool.",
         ]
@@ -936,6 +1003,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     command = args.command or "menu"
     if command != "menu":
         _print_config_warnings(config)
+        for warning in installation_warnings():
+            print(f"warning: {warning}", file=sys.stderr)
+        for warning in docker.environment_warnings():
+            print(f"warning: {warning}", file=sys.stderr)
 
     try:
         if command == "menu":

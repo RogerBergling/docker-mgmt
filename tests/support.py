@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -19,8 +20,10 @@ def fake_environment(tmp: Path) -> dict[str, str]:
     docker_link = bin_dir / "docker"
     if docker_link.exists() or docker_link.is_symlink():
         docker_link.unlink()
-    os.symlink(FAKE_DOCKER, docker_link)
-    os.chmod(FAKE_DOCKER, 0o755)
+    # Copy rather than symlink so the fake binary is owned by the test process
+    # even when the suite is run as root.
+    shutil.copy2(FAKE_DOCKER, docker_link)
+    os.chmod(docker_link, 0o755)
     state = tmp / "docker-state.json"
     log = tmp / "docker-argv.log"
     state.write_text(
@@ -38,11 +41,23 @@ def fake_environment(tmp: Path) -> dict[str, str]:
         encoding="utf-8",
     )
     env = os.environ.copy()
-    env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
+    # Keep tests deterministic when the suite is run as root: the fake binary
+    # directory plus standard root-owned system paths.
+    env["PATH"] = str(bin_dir) + ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     env["FAKE_DOCKER_STATE"] = str(state)
     env["FAKE_DOCKER_LOG"] = str(log)
     env["DOCKER_MGMT_LOCK"] = str(tmp / "docker-mgmt.lock")
     env["NO_COLOR"] = "1"
+    for name in (
+        "DOCKER_CONFIG",
+        "DOCKER_CONTEXT",
+        "DOCKER_HOST",
+        "COMPOSE_FILE",
+        "COMPOSE_PROJECT_NAME",
+        "COMPOSE_PROFILES",
+        "COMPOSE_ENV_FILES",
+    ):
+        env.pop(name, None)
     return env
 
 
@@ -112,6 +127,7 @@ allow_unsafe_ownership = {"true" if allow_unsafe else "false"}
 """
     path = tmp / "config.ini"
     path.write_text(content, encoding="utf-8")
+    os.chmod(path, 0o644)
     return path
 
 

@@ -134,6 +134,31 @@ class TrustTests(unittest.TestCase):
             )
             self.assertEqual(len(issues), len(set(issues)))
 
+    def test_sticky_world_writable_target_directory_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            target = Path(raw) / "shared-build-context"
+            target.mkdir()
+            os.chmod(target, 0o1777)
+            issues = check_path_trust(target, euid=os.geteuid())
+            self.assertTrue(
+                any("sticky" in issue and "target directory" in issue for issue in issues),
+                issues,
+            )
+
+    def test_sticky_parent_directory_is_allowed_for_a_file(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            parent = Path(raw) / "shared"
+            parent.mkdir()
+            os.chmod(parent, 0o1777)
+            path = parent / "compose.yaml"
+            path.write_text("services: {}\n", encoding="utf-8")
+            os.chmod(path, 0o644)
+            issues = check_path_trust(path, euid=os.geteuid())
+            self.assertFalse(
+                any("sticky" in issue or "group/world-writable" in issue for issue in issues),
+                issues,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

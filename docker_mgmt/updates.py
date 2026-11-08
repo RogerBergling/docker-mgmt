@@ -11,6 +11,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
 
+from .config import Config
+from .discovery import reference_findings
 from .docker import DockerClient
 from .models import (
     ComposeProject,
@@ -19,8 +21,83 @@ from .models import (
     ServiceUpdate,
 )
 from .runner import CommandResult, summarize_output
+from .security import check_project_trust
 
 ProgressCallback = Callable[[str], None]
+
+
+@dataclass
+class PullPreflight:
+    """Non-interactive checks required before `compose pull` runs."""
+
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+
+def pull_preflight(project: ComposeProject, config: Config) -> PullPreflight:
+    """Validate trust and block unsafe projects before an image pull.
+
+    Pulling does not recreate containers, so high-risk Compose settings only
+    produce warnings here. File trust, blockers, invalid projects and
+    unverified include/extends references still block unless the corresponding
+    dangerous configuration option is enabled.
+    """
+
+    result = PullPreflight()
+    if not project.valid:
+        result.errors.append(project.error or "invalid Compose configuration")
+        return result
+    if project.blockers:
+        result.errors.append(
+            "project has unresolved blockers: " + "; ".join(project.blockers)
+        )
+
+    reference_warnings, unverified = reference_findings(project.files)
+    if unverified and not project.unverified_references:
+        project.unverified_references = True
+        for warning in reference_warnings:
+            if warning not in project.warnings:
+                project.warnings.append(warning)
+    if project.unverified_references:
+        if not config.allow_unverified_references:
+            result.errors.append(
+                "include/extends references cannot be individually trust-checked; "
+                "keep the project tree controlled by root/current user or set "
+                "security.allow_unverified_references=true after review"
+            )
+        else:
+            result.warnings.append(
+                "include/extends references are allowed by configuration but are "
+                "not individually trust-checked"
+            )
+
+    trust = check_project_trust(
+        project.files,
+        project.env_files,
+        project.build_contexts,
+        project.extra_files,
+    )
+    if trust:
+        if not config.allow_unsafe_ownership:
+            result.errors.append(
+                "files used by this project are not controlled by root/current user"
+            )
+            result.errors.extend(trust)
+        else:
+            result.warnings.append(
+                "unsafe file ownership is allowed by configuration for this project"
+            )
+            result.warnings.extend(trust)
+
+    if project.critical_warnings:
+        result.warnings.append(
+            "high-risk Docker settings are present; pull does not recreate containers"
+        )
+    return result
 
 
 @dataclass

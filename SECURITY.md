@@ -73,22 +73,34 @@ before `up -d`. Pulling alone never restarts a container.
 - `DOCKER_HOST` is not overridden. If it is set, the menu warns that actions may
   target a remote daemon.
 
-### 3. Root file-trust checks
+### 3. File-trust checks
 
-Before a project-scoped mutation while running as root:
+Before a project-scoped mutation, Docker-privileged runs (root or a user in the
+`docker` group) check:
 
-- The Compose file(s), the automatically loaded project `.env`, service
-  `env_file` paths, local build contexts, build Dockerfiles, and local Compose
-  `secrets`/`configs` files are checked.
-- The file/directory and its parent chain must be root-owned.
+- The Compose file(s), including standard override files; the automatically
+  loaded project `.env`; service `env_file` paths; local build contexts; build
+  Dockerfiles; and local Compose `secrets`/`configs` files.
+- The file/directory and its parent chain must be owned by root or the current
+  user.
 - No component may be group- or world-writable; sticky root-owned directories
   such as `/tmp` are tolerated because non-owners cannot remove a root-owned
   entry there.
-- Paths that do not exist, symlink escapes outside scan roots, and non-root
+- Paths that do not exist, symlink escapes outside scan roots, and unexpected
   ownership are rejected.
 - Compose `include` and service `extends` references are difficult to enumerate
-  without a YAML parser. A warning is added when they appear in the primary
-  Compose file; keep the whole project tree root-owned and non-writable.
+  without a YAML parser. Projects using them are blocked from mutating actions
+  by default. `security.allow_unverified_references=true` is an explicit
+  residual-risk override; keep the whole project tree controlled by root/user.
+- Standard override files are included explicitly in the Compose file list so
+  `compose up` uses the same merged configuration that was validated and
+  trust-checked.
+- Build-context directories and Dockerfiles are checked, but the entire
+  build-context tree is not recursively verified. Keep all files in a build
+  context controlled by root/current user and non-writable by others.
+- Trust checks inspect POSIX owner/mode bits. They do not inspect POSIX ACLs,
+  SELinux labels, mount options, or immutable attributes. A host using those
+  controls should verify them separately.
 
 Why this matters: if a deploy user can edit a Compose file that root runs with
 `docker compose up`, that user can mount `/`, add `privileged: true`, or
@@ -96,9 +108,10 @@ otherwise obtain root. The check is intentionally strict. Use
 `security.allow_unsafe_ownership=true` only if you understand and accept that
 risk; it is never the default.
 
-When running as a non-root user with Docker access, the tool cannot enforce root
-ownership. It still reports world-writable paths. Docker group membership is
-itself root-equivalent.
+When running as a non-root user with Docker access, the same ownership policy
+applies with the current user added as an allowed owner. Docker group membership
+is itself root-equivalent, so group-writable project files are not accepted by
+default.
 
 ### 4. High-risk Compose review
 
@@ -139,8 +152,8 @@ checks do not enumerate.
   views remain available.
 - The log rotates to `<name>.1` above `audit.max_bytes`.
 
-The audit log is local and root-controlled, but a root attacker can alter or
-delete it. Ship logs to a remote collector if you need tamper resistance.
+The audit log is local and controlled by its owner, but a root attacker can
+alter or delete it. Ship logs to a remote collector if you need tamper resistance.
 
 ### 6. Host-wide operation lock
 
@@ -163,10 +176,19 @@ delete it. Ship logs to a remote collector if you need tamper resistance.
 - As root, the config file and all parent directories must be root-owned and not
   group/world-writable. A symlinked config is rejected so a writable parent
   cannot redirect root to attacker-controlled settings.
+- As a non-root user with Docker access, the config must be owned by the user or
+  root and must not be group/world-writable. Another local user who can modify
+  the config could redirect the operator to attacker-controlled Compose files.
+- When running as root, the resolved `docker` executable and its parent path
+  must be root-controlled. Root runs also refuse a `PATH` or
+  `DOCKER_CONFIG`/`HOME/.docker` path not controlled by root, because Docker
+  can load credential helpers and CLI plugins from them. Remote
+  `DOCKER_HOST`/`DOCKER_CONTEXT` settings are reported as warnings, not blocked.
 - The audit path is similarly validated.
 - Lock files use `O_NOFOLLOW`, mode `0600`, and an ownership check.
-- The config file cannot specify an arbitrary executable; Docker is invoked
-  through the fixed `docker` CLI in `PATH`.
+- The config file cannot specify an arbitrary executable. Docker is located
+  through `PATH` but resolved to an absolute path, and root runs verify that the
+  executable and its parent chain are root-controlled.
 
 ### 9. Secret handling
 
@@ -187,12 +209,13 @@ environments in a shared terminal.
 
 ## Trust boundaries
 
-1. **The Docker CLI and daemon.** The tool trusts the `docker` binary in `PATH`
-   and the daemon it talks to. A compromised Docker installation defeats every
-   control here.
-2. **The Compose files and build contexts.** Root-run Compose actions require
-   root-controlled files. The contents are still trusted to be operationally
-   correct; the tool cannot make `privileged: true` safe.
+1. **The Docker CLI and daemon.** Root runs verify the resolved `docker`
+   binary path, but the daemon and its plugins are still trusted. A compromised
+   Docker installation defeats every control here.
+2. **The Compose files and build contexts.** Docker-privileged Compose actions
+   require files controlled by root or the current user. The contents are still
+   trusted to be operationally correct; the tool cannot make
+   `privileged: true` safe.
 3. **The image supply chain.** Pulling an image does not execute it, but
    `up -d` does. Pin digests, use trusted registries, scan images, and review
    upstream changes.
@@ -200,6 +223,10 @@ environments in a shared terminal.
    non-root user can change it, they can change scan roots and the unsafe
    ownership setting.
 5. **The audit destination.** Local logs are not tamper-proof against root.
+6. **The docker-mgmt installation.** Root must execute code from a root-owned
+   directory. Running `sudo` on a user-writable checkout lets anyone who can
+   edit that checkout execute code as root. The tool warns when it detects this,
+   but the operator must install it safely.
 6. **The operator.** The tool reduces accidental risk and provides an audit
    trail; it does not replace change management, backups, or monitoring.
 

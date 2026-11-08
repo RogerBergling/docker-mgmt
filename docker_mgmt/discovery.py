@@ -32,15 +32,26 @@ BASE_NAMES: tuple[str, ...] = (
     "docker-compose.yaml",
     "docker-compose.yml",
 )
-OVERRIDE_NAMES: frozenset[str] = frozenset(
-    {
-        "compose.override.yaml",
-        "compose.override.yml",
+OVERRIDE_NAMES: tuple[str, ...] = (
+    "compose.override.yaml",
+    "compose.override.yml",
+    "docker-compose.override.yaml",
+    "docker-compose.override.yml",
+)
+BASE_OVERRIDE_MAP: dict[str, tuple[str, ...]] = {
+    "compose.yaml": ("compose.override.yaml", "compose.override.yml"),
+    "compose.yml": ("compose.override.yaml", "compose.override.yml"),
+    "docker-compose.yaml": (
         "docker-compose.override.yaml",
         "docker-compose.override.yml",
-    }
-)
+    ),
+    "docker-compose.yml": (
+        "docker-compose.override.yaml",
+        "docker-compose.override.yml",
+    ),
+}
 YAML_SUFFIXES = frozenset({".yml", ".yaml"})
+MAX_YAML_BYTES = 5 * 1024 * 1024
 PROTECTED_PATHS: tuple[str, ...] = (
     "/proc",
     "/sys",
@@ -196,6 +207,16 @@ def scan_candidates(
                         f"ignoring symlink that escapes scan roots: {path} -> {resolved}"
                     )
                     continue
+                try:
+                    if resolved.stat().st_size > MAX_YAML_BYTES:
+                        warnings.append(
+                            f"ignoring oversized Compose file "
+                            f"(> {MAX_YAML_BYTES // (1024 * 1024)} MiB): {resolved}"
+                        )
+                        continue
+                except OSError:
+                    warnings.append(f"cannot stat candidate: {resolved}")
+                    continue
                 lowered = filename.lower()
                 if lowered not in BASE_NAMES and lowered not in OVERRIDE_NAMES:
                     if not _looks_like_compose(resolved):
@@ -253,6 +274,36 @@ def _project_stub(
     )
 
 
+def _normalise_files(files: Sequence[Path]) -> tuple[Path, ...]:
+    normalised: list[Path] = []
+    for raw in files:
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        path = path.resolve(strict=False)
+        if path not in normalised:
+            normalised.append(path)
+    return tuple(normalised)
+
+
+def _with_standard_overrides(files: Sequence[Path]) -> tuple[Path, ...]:
+    """Explicitly merge standard override files so they are validated/trusted.
+
+    Using `-f BASE` makes the file list explicit; Compose does not discover a
+    sibling compose.override.yaml in that mode. Adding matching overrides both
+    preserves normal Compose semantics and lets the root trust check inspect
+    them before `up -d`.
+    """
+
+    result = list(_normalise_files(files))
+    for path in list(result):
+        for override_name in BASE_OVERRIDE_MAP.get(path.name.lower(), ()):
+            override = (path.parent / override_name).resolve(strict=False)
+            if override.exists() and override not in result:
+                result.append(override)
+    return tuple(result)
+
+
 def build_project(
     files: Sequence[Path],
     docker: DockerClient,
@@ -260,7 +311,18 @@ def build_project(
     project_name: Optional[str] = None,
     source: str = "scan",
 ) -> ComposeProject:
-    resolved_files = tuple(Path(path) for path in files)
+    resolved_files = _with_standard_overrides(files)
+    for path in resolved_files:
+        try:
+            if path.stat().st_size > MAX_YAML_BYTES:
+                return _project_stub(
+                    resolved_files,
+                    project_name=project_name,
+                    source=source,
+                    error=f"Compose file is too large to validate safely: {path}",
+                )
+        except OSError:
+            pass
     try:
         metadata = docker.compose_config(
             resolved_files, project_name=project_name
@@ -272,6 +334,9 @@ def build_project(
             source=source,
             error=exc.message,
         )
+    reference_warnings, unverified_references = reference_findings(
+        resolved_files
+    )
     return ComposeProject(
         files=resolved_files,
         project_name=metadata.project_name or normalize_project_name(
@@ -280,8 +345,7 @@ def build_project(
         services=list(metadata.analysis.services),
         valid=True,
         error=None,
-        warnings=list(metadata.analysis.warnings)
-        + _unchecked_reference_warnings(resolved_files),
+        warnings=list(metadata.analysis.warnings) + reference_warnings,
         critical_warnings=list(metadata.analysis.critical_warnings),
         env_files=_project_env_files(
             resolved_files[0].parent, metadata.analysis.env_files
@@ -289,6 +353,7 @@ def build_project(
         build_contexts=metadata.analysis.build_contexts,
         extra_files=metadata.analysis.extra_files,
         source=source,
+        unverified_references=unverified_references,
     )
 
 
@@ -305,25 +370,38 @@ def _project_env_files(project_dir: Path, discovered: Sequence[Path]) -> tuple[P
     return tuple(env_files)
 
 
-def _unchecked_reference_warnings(files: Sequence[Path]) -> list[str]:
-    """Warn about include/extends files the static trust check cannot enumerate."""
+def reference_findings(
+    files: Sequence[Path],
+) -> tuple[list[str], bool]:
+    """Detect include/extends because their referenced files need manual trust."""
 
     warnings: list[str] = []
     pattern = re.compile(r"(?m)^[ \t]*(include|extends)[ \t]*:")
+    unverified = False
     for path in files:
         try:
+            size = path.stat().st_size
+            if size > MAX_YAML_BYTES:
+                warnings.append(
+                    f"{path}: too large to inspect for include/extends; "
+                    "referenced files could not be trust-checked"
+                )
+                unverified = True
+                continue
             with path.open("rb") as handle:
-                text = handle.read(256 * 1024).decode("utf-8", "replace")
+                text = handle.read(MAX_YAML_BYTES).decode("utf-8", "replace")
         except OSError:
             continue
         match = pattern.search(text)
         if match:
+            unverified = True
             warnings.append(
                 f"{path}: uses `{match.group(1)}`; referenced files are not "
-                "individually trust-checked, so keep the entire project tree "
-                "root-owned and non-writable"
+                "individually trust-checked. Keep the entire project tree "
+                "controlled by root/current user, or set "
+                "security.allow_unverified_references=true after review."
             )
-    return warnings
+    return warnings, unverified
 
 
 def _config_files_from_label(raw: object, working_dir: Optional[str]) -> list[Path]:
@@ -564,6 +642,7 @@ def project_to_dict(project: ComposeProject) -> dict[str, object]:
         "project": project.project_name,
         "files": [str(path) for path in project.files],
         "source": project.source,
+        "unverified_references": project.unverified_references,
         "valid": project.valid,
         "error": project.error,
         "blockers": list(project.blockers),

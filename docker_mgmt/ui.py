@@ -11,6 +11,8 @@ import shutil
 import textwrap
 from typing import Generic, Optional, Sequence, TypeVar
 
+from .runner import sanitize_text
+
 
 class QuitApp(Exception):
     """Raised when the operator asks to leave the interactive menu."""
@@ -32,12 +34,18 @@ class UI(Generic[T]):
         self.color = color
         self.page_size = max(5, page_size)
 
-    def _paint(self, text: str, code: str) -> str:
+    @staticmethod
+    def _safe(text: object) -> str:
+        return sanitize_text(str(text), max_length=16000)
+
+    def _paint(self, text: object, code: str) -> str:
+        text = self._safe(text)
         if not self.color:
             return text
         return f"{code}{text}{self.RESET}"
 
     def header(self, title: str) -> None:
+        title = self._safe(title)
         line = "=" * max(8, len(title))
         print()
         print(self._paint(title, self.BOLD))
@@ -48,7 +56,7 @@ class UI(Generic[T]):
         print(self._paint(title, self.BOLD))
 
     def info(self, text: str) -> None:
-        print(text)
+        print(self._safe(text))
 
     def success(self, text: str) -> None:
         print(self._paint(text, self.GREEN))
@@ -64,14 +72,21 @@ class UI(Generic[T]):
 
     def bullets(self, values: Sequence[str], prefix: str = "  - ") -> None:
         for value in values:
-            print(prefix + str(value))
+            print(prefix + sanitize_text(str(value), max_length=4000))
 
     def key_values(self, values: Sequence[tuple[str, object]], indent: str = "  ") -> None:
         if not values:
             return
-        width = max(len(str(key)) for key, _ in values)
-        for key, value in values:
-            print(f"{indent}{str(key).ljust(width)} : {value}")
+        cleaned = [
+            (
+                sanitize_text(str(key), max_length=200),
+                sanitize_text(str(value), max_length=4000),
+            )
+            for key, value in values
+        ]
+        width = max(len(key) for key, _ in cleaned)
+        for key, value in cleaned:
+            print(f"{indent}{key.ljust(width)} : {value}")
 
     def pause(self, message: str = "Press Enter to continue...") -> None:
         try:
@@ -137,9 +152,14 @@ class UI(Generic[T]):
         filter_text = ""
         while True:
             filtered = [
-                (index, label, value)
+                (
+                    index,
+                    self._menu_text(label),
+                    value,
+                )
                 for index, (label, value) in enumerate(options)
-                if not filter_text or filter_text.lower() in str(label).lower()
+                if not filter_text
+                or filter_text.lower() in self._menu_text(label).lower()
             ]
             pages = max(1, math.ceil(len(filtered) / size))
             page = max(0, min(page, pages - 1))
@@ -293,7 +313,14 @@ class UI(Generic[T]):
 
     @staticmethod
     def _one_line(value: str) -> str:
+        value = sanitize_text(value, max_length=4000)
         return " ".join(value.replace("\t", " ").splitlines())
+
+    @staticmethod
+    def _menu_text(value: object) -> str:
+        return " ".join(
+            sanitize_text(str(value), max_length=4000).replace("\t", " ").splitlines()
+        )
 
     @staticmethod
     def _truncate(value: str, width: int) -> str:

@@ -9,6 +9,7 @@ running `docker` manually therefore applies.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 from dataclasses import dataclass
@@ -25,7 +26,7 @@ from .runner import (
     sanitize_text,
     summarize_output,
 )
-from .security import ComposeAnalysis, analyze_compose
+from .security import ComposeAnalysis, analyze_compose, check_path_trust
 
 
 class DockerError(DockerMgmtError):
@@ -93,7 +94,8 @@ class DockerClient:
     def __init__(self, runner: CommandRunner, config: Config) -> None:
         self.runner = runner
         self.config = config
-        self.docker = shutil.which("docker") or "docker"
+        found = shutil.which("docker")
+        self.docker = str(Path(found).resolve()) if found else "docker"
         self._compose_version: Optional[tuple[int, int, int]] = None
         self._compose_version_string: Optional[str] = None
         self._server_version: Optional[str] = None
@@ -111,6 +113,23 @@ class DockerClient:
             "COMPOSE_ANSI": "never",
         }
 
+    @staticmethod
+    def _normalise_files(files: Sequence[Path]) -> list[Path]:
+        normalised: list[Path] = []
+        for raw in files:
+            path = Path(raw).expanduser()
+            if not path.is_absolute():
+                path = Path.cwd() / path
+            try:
+                path = path.resolve(strict=False)
+            except (OSError, RuntimeError) as exc:
+                raise DockerError(
+                    f"cannot resolve Compose file path {path}: {exc}"
+                ) from exc
+            if path not in normalised:
+                normalised.append(path)
+        return normalised
+
     def compose_argv(
         self,
         files: Sequence[Path],
@@ -118,9 +137,10 @@ class DockerClient:
         project_dir: Optional[Path] = None,
         project_name: Optional[str] = None,
     ) -> list[str]:
+        files = self._normalise_files(files)
         if not files:
             raise DockerError("no Compose files supplied")
-        directory = project_dir or Path(files[0]).parent
+        directory = Path(project_dir).resolve(strict=False) if project_dir else files[0].parent
         argv = [
             self.docker,
             "compose",
@@ -160,20 +180,35 @@ class DockerClient:
         timeout: Optional[float] = None,
         project_name: Optional[str] = None,
     ) -> CommandResult:
+        normalised = self._normalise_files(files)
+        if not normalised:
+            raise DockerError("no Compose files supplied")
         return self._run(
-            self.compose_argv(files, *args, project_name=project_name),
+            self.compose_argv(normalised, *args, project_name=project_name),
             timeout=timeout or self.config.command_timeout,
-            cwd=Path(files[0]).parent,
+            cwd=normalised[0].parent,
         )
 
     # ------------------------------------------------------------------
     # Availability and versions
     # ------------------------------------------------------------------
-    def ensure_available(self) -> str:
-        if not shutil.which("docker"):
+    def _validate_docker_binary(self) -> None:
+        path = Path(self.docker)
+        if not path.is_absolute() or not path.is_file() or not os.access(path, os.X_OK):
             raise DockerUnavailable(
-                "docker CLI not found in PATH; install Docker Engine and retry"
+                "docker CLI not found or not executable; install Docker Engine and retry"
             )
+        if os.geteuid() == 0:
+            issues = check_path_trust(path, euid=0)
+            if issues:
+                raise DockerUnavailable(
+                    "refusing to execute a docker binary from an unsafe path: "
+                    + "; ".join(issues)
+                )
+
+    def ensure_available(self) -> str:
+        self._validate_docker_binary()
+        self._validate_environment()
         result = self._run(
             [self.docker, "version", "--format", "{{.Server.Version}}"],
             timeout=20,
@@ -192,6 +227,123 @@ class DockerClient:
 
     def server_version(self) -> Optional[str]:
         return self._server_version
+
+    @staticmethod
+    def _strict_environment_path_issues(path: Path) -> list[str]:
+        """Trust check for directories used as executable/config search paths.
+
+        Unlike a parent directory of a root-owned file, a search directory must
+        not be sticky-world-writable: an attacker could create a new credential
+        helper or CLI plugin in /tmp even if existing files are protected.
+        """
+
+        issues = check_path_trust(path, euid=0)
+        try:
+            mode = path.stat().st_mode
+        except OSError:
+            return issues
+        if mode & 0o022:
+            message = (
+                f"{path} is group/world-writable (mode {mode & 0o777:04o})"
+            )
+            if message not in issues:
+                issues.append(message)
+        return issues
+
+    def _root_environment_issues(self) -> list[str]:
+        if os.geteuid() != 0:
+            return []
+        issues: list[str] = []
+        for entry in os.environ.get("PATH", "").split(os.pathsep):
+            if not entry:
+                issues.append(
+                    "PATH contains an empty entry (current directory), which is "
+                    "not safe for a Docker-privileged process"
+                )
+                continue
+            path = Path(entry)
+            if path.is_dir():
+                for issue in self._strict_environment_path_issues(path):
+                    if issue not in issues:
+                        issues.append(f"PATH {issue}")
+        docker_config = os.environ.get("DOCKER_CONFIG")
+        config_path = (
+            Path(docker_config).expanduser()
+            if docker_config
+            else Path.home() / ".docker"
+        )
+        if config_path.exists():
+            for issue in self._strict_environment_path_issues(config_path):
+                if issue not in issues:
+                    issues.append(f"Docker config {issue}")
+        return issues
+
+    def _validate_environment(self) -> None:
+        issues = self._root_environment_issues()
+        if issues:
+            raise DockerUnavailable(
+                "refusing to run with a root environment that is not "
+                "root-controlled: " + "; ".join(issues[:5])
+            )
+
+    def environment_warnings(self) -> list[str]:
+        """Warn about Docker environment variables that change the target/trust."""
+
+        warnings: list[str] = []
+        docker_host = os.environ.get("DOCKER_HOST")
+        if docker_host:
+            warnings.append(
+                f"DOCKER_HOST is set; actions may target a remote daemon: {docker_host}"
+            )
+        docker_context = os.environ.get("DOCKER_CONTEXT")
+        if docker_context and docker_context != "default":
+            warnings.append(
+                f"DOCKER_CONTEXT={docker_context!r} is set; verify it does not "
+                "target an unexpected remote daemon"
+            )
+        docker_config = os.environ.get("DOCKER_CONFIG")
+        if docker_config:
+            config_path = Path(docker_config).expanduser()
+            label = "DOCKER_CONFIG"
+        elif os.geteuid() == 0:
+            config_path = Path.home() / ".docker"
+            label = "HOME/.docker"
+        else:
+            config_path = None
+            label = ""
+        if config_path is not None and config_path.exists():
+            issues = (
+                self._strict_environment_path_issues(config_path)
+                if os.geteuid() == 0
+                else check_path_trust(config_path, euid=os.geteuid())
+            )
+            if issues:
+                warnings.append(
+                    f"{label} points to a path not controlled by root/current "
+                    "user; Docker CLI plugins or auth configuration could be altered: "
+                    + "; ".join(issues[:3])
+                )
+        if os.geteuid() == 0:
+            if any(not entry for entry in os.environ.get("PATH", "").split(os.pathsep)):
+                warnings.append(
+                    "root PATH contains an empty entry (current directory); "
+                    "Docker credential helpers or CLI plugins could be intercepted"
+                )
+            for entry in os.environ.get("PATH", "").split(os.pathsep):
+                if not entry:
+                    continue
+                path = Path(entry)
+                if not path.is_dir():
+                    continue
+                issues = self._strict_environment_path_issues(path)
+                if issues:
+                    warnings.append(
+                        "root PATH contains a directory not controlled by root; "
+                        "Docker credential helpers or CLI plugins could be "
+                        f"intercepted: {path}"
+                    )
+                    break
+        return warnings
 
     def compose_version(self) -> Optional[tuple[int, int, int]]:
         if self._compose_version is not None:
@@ -295,7 +447,7 @@ class DockerClient:
         for start in range(0, len(ids), 64):
             chunk = ids[start : start + 64]
             inspected = self._run(
-                [self.docker, "inspect", "--type", "container", *chunk],
+                [self.docker, "inspect", "--type", "container", "--", *chunk],
                 timeout=self.config.command_timeout,
             )
             if inspected.ok:
@@ -304,7 +456,7 @@ class DockerClient:
             # A container may disappear between ps and inspect. Retry singly.
             for container_id in chunk:
                 single = self._run(
-                    [self.docker, "inspect", "--type", "container", container_id],
+                    [self.docker, "inspect", "--type", "container", "--", container_id],
                     timeout=self.config.command_timeout,
                 )
                 if single.ok:
@@ -418,7 +570,7 @@ class DockerClient:
 
     def image_id(self, image: str) -> Optional[str]:
         result = self._run(
-            [self.docker, "image", "inspect", "--format", "{{.Id}}", image],
+            [self.docker, "image", "inspect", "--format", "{{.Id}}", "--", image],
             timeout=30,
         )
         if not result.ok:
@@ -515,7 +667,7 @@ class DockerClient:
         if action not in {"start", "stop", "restart"}:
             raise DockerError(f"unsupported container action: {action}")
         return self._run(
-            [self.docker, action, container], timeout=self.config.up_timeout
+            [self.docker, action, "--", container], timeout=self.config.up_timeout
         )
 
     # ------------------------------------------------------------------
@@ -532,9 +684,12 @@ class DockerClient:
         args = ["logs", "--tail", str(tail), "--no-color"]
         if follow:
             args.append("--follow")
+        normalised = self._normalise_files(files)
+        if not normalised:
+            raise DockerError("no Compose files supplied")
         return self.runner.stream(
-            self.compose_argv(files, *args, project_name=project_name),
-            cwd=Path(files[0]).parent,
+            self.compose_argv(normalised, *args, project_name=project_name),
+            cwd=normalised[0].parent,
             env=self._env(),
         )
 
@@ -544,7 +699,7 @@ class DockerClient:
         args = [self.docker, "logs", "--tail", str(tail)]
         if follow:
             args.append("--follow")
-        args.append(container)
+        args.extend(["--", container])
         return self.runner.stream(args, env=self._env())
 
     def system_df(self) -> CommandResult:
@@ -559,7 +714,7 @@ class DockerClient:
     def stats(self, container: Optional[str] = None) -> list[dict[str, object]]:
         args = [self.docker, "stats", "--no-stream", "--format", "{{json .}}"]
         if container:
-            args.append(container)
+            args.extend(["--", container])
         result = self._run(args, timeout=60)
         if not result.ok:
             raise DockerError("docker stats failed: " + summarize_output(result))
@@ -598,4 +753,6 @@ class DockerClient:
         return format_command(argv)
 
     def redact(self, text: str) -> str:
-        return sanitize_text(text)
+        from .runner import redact_text
+
+        return redact_text(sanitize_text(text))
