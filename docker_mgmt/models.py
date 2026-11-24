@@ -135,6 +135,7 @@ class ProjectUpdateReport:
     pull_error: Optional[str] = None
     skipped_reason: Optional[str] = None
     skipped_error: bool = False
+    containers_seen: int = 0
 
     @property
     def has_updates(self) -> bool:

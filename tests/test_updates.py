@@ -50,6 +50,9 @@ class StubDocker:
         self.up_calls += 1
         return result(True)
 
+    def compose_containers(self, files, project_name=None):
+        return []
+
 
 def project(image: str = "nginx:1.27") -> ComposeProject:
     return ComposeProject(
@@ -116,6 +119,24 @@ class CheckProjectTests(unittest.TestCase):
         report = check_project(docker, project(), [])
         self.assertEqual(report.services[0].status, "new-image")
         self.assertTrue(report.has_updates)
+
+    def test_not_running_detail_names_compose_labels(self) -> None:
+        docker = StubDocker({"nginx:1.27": NEW}, {"nginx:1.27": NEW})
+        report = check_project(docker, project(), [])
+        self.assertEqual(report.services[0].status, "not-running")
+        self.assertIn("project='app'", report.services[0].detail)
+        self.assertIn("service='web'", report.services[0].detail)
+        self.assertIn("sees no containers", report.services[0].detail)
+
+    def test_not_running_detail_lists_other_running_services(self) -> None:
+        docker = StubDocker({"nginx:1.27": NEW}, {"nginx:1.27": NEW})
+        other = container(NEW)
+        other.service = "old-service"
+        report = check_project(docker, project(), [other])
+        self.assertEqual(report.services[0].status, "not-running")
+        self.assertIn("running services in this project", report.services[0].detail)
+        self.assertIn("'old-service'", report.services[0].detail)
+        self.assertEqual(report.containers_seen, 1)
 
     def test_build_only_project_skips_pull(self) -> None:
         build_project = ComposeProject(

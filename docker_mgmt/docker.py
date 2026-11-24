@@ -90,6 +90,33 @@ def _is_unknown_flag(result: CommandResult) -> bool:
     return "unknown flag" in text or "unknown shorthand flag" in text
 
 
+def _first_value(item: dict[str, object], *keys: str) -> object:
+    for key in keys:
+        if key in item:
+            return item[key]
+    return None
+
+
+# A compact inspect template avoids pulling the full container JSON (including
+# environment variables and network state) into memory. The full JSON can be
+# large and is truncated by the command runner, which used to turn a valid
+# container list into a silent empty list. `docker inspect` prints one record
+# per container, which is valid JSON Lines.
+CONTAINER_INSPECT_TEMPLATE = (
+    '{"id":{{json .Id}},'
+    '"image_id":{{json .Image}},'
+    '"image":{{json .Config.Image}},'
+    '"state":{{json .State.Status}},'
+    '"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}""{{end}},'
+    '"restart_count":{{json .RestartCount}},'
+    '"exit_code":{{json .State.ExitCode}},'
+    '"name":{{json .Name}},'
+    '"created":{{json .Created}},'
+    '"labels":{{json .Config.Labels}},'
+    '"port_bindings":{{json .HostConfig.PortBindings}}}'
+)
+
+
 class DockerClient:
     def __init__(self, runner: CommandRunner, config: Config) -> None:
         self.runner = runner
@@ -444,37 +471,117 @@ class DockerClient:
             raise DockerError("cannot list containers: " + summarize_output(result))
         ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         containers: list[Container] = []
+        errors: list[str] = []
         for start in range(0, len(ids), 64):
             chunk = ids[start : start + 64]
-            inspected = self._run(
-                [self.docker, "inspect", "--type", "container", "--", *chunk],
-                timeout=self.config.command_timeout,
+            inspected, error = self._inspect_containers(chunk)
+            containers.extend(inspected)
+            if error:
+                errors.append(error)
+
+        if ids and not containers:
+            detail = errors[-1] if errors else "docker inspect returned no usable data"
+            raise DockerError(
+                f"docker ps reported {len(ids)} container(s), but none could be "
+                f"inspected: {detail}. If containers are running, verify the Docker "
+                "context, DOCKER_HOST/DOCKER_CONTEXT, and permissions."
             )
-            if inspected.ok:
-                containers.extend(self._parse_inspect(inspected.stdout))
-                continue
-            # A container may disappear between ps and inspect. Retry singly.
-            for container_id in chunk:
-                single = self._run(
-                    [self.docker, "inspect", "--type", "container", "--", container_id],
-                    timeout=self.config.command_timeout,
-                )
-                if single.ok:
-                    containers.extend(self._parse_inspect(single.stdout))
+
         containers.sort(key=lambda item: (item.project or "~", item.name))
         return containers
 
+    def _inspect_containers(
+        self, ids: Sequence[str]
+    ) -> tuple[list[Container], Optional[str]]:
+        """Inspect containers using a compact template, with fallbacks.
+
+        Older Docker/Podman versions may not support `docker container inspect
+        --format`, and a container can disappear between `ps` and `inspect`.
+        Falling back keeps normal races from hiding every container.
+        """
+
+        batch_commands = (
+            [
+                self.docker,
+                "container",
+                "inspect",
+                "--format",
+                CONTAINER_INSPECT_TEMPLATE,
+                "--",
+                *ids,
+            ],
+            [
+                self.docker,
+                "inspect",
+                "--type",
+                "container",
+                "--format",
+                CONTAINER_INSPECT_TEMPLATE,
+                "--",
+                *ids,
+            ],
+            [self.docker, "inspect", "--type", "container", "--", *ids],
+        )
+        last_error: Optional[str] = None
+        for argv in batch_commands:
+            inspected = self._run(argv, timeout=self.config.command_timeout)
+            if inspected.ok:
+                parsed = self._parse_inspect(inspected.stdout)
+                if parsed:
+                    return parsed, None
+                last_error = "docker inspect returned output that could not be parsed"
+            else:
+                last_error = summarize_output(inspected)
+
+        # A container may disappear between ps and inspect, or one malformed
+        # record may break the batch. Retry individually so one bad container
+        # does not hide the rest.
+        single_containers: list[Container] = []
+        for container_id in ids:
+            single_commands = (
+                [
+                    self.docker,
+                    "container",
+                    "inspect",
+                    "--format",
+                    CONTAINER_INSPECT_TEMPLATE,
+                    "--",
+                    container_id,
+                ],
+                [
+                    self.docker,
+                    "container",
+                    "inspect",
+                    "--format",
+                    CONTAINER_INSPECT_TEMPLATE,
+                    container_id,
+                ],
+                [
+                    self.docker,
+                    "inspect",
+                    "--type",
+                    "container",
+                    container_id,
+                ],
+            )
+            for argv in single_commands:
+                inspected = self._run(argv, timeout=self.config.command_timeout)
+                if inspected.ok:
+                    parsed = self._parse_inspect(inspected.stdout)
+                    if parsed:
+                        single_containers.extend(parsed)
+                        break
+                else:
+                    last_error = summarize_output(inspected)
+
+        if single_containers:
+            return single_containers, None
+        return [], last_error
+
     def _parse_inspect(self, text: str) -> list[Container]:
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            return []
-        if isinstance(data, dict):
-            data = [data]
-        if not isinstance(data, list):
-            return []
+        records = parse_json_records(text)
         result: list[Container] = []
-        for item in data:
+        for item in records:
             if not isinstance(item, dict):
                 continue
             container = self._container_from_inspect(item)
@@ -482,33 +589,61 @@ class DockerClient:
                 result.append(container)
         return result
 
-    def _container_from_inspect(self, item: dict[str, object]) -> Optional[Container]:
-        state = item.get("State") if isinstance(item.get("State"), dict) else {}
-        health_obj = (
-            state.get("Health") if isinstance(state.get("Health"), dict) else {}
-        )
-        config = item.get("Config") if isinstance(item.get("Config"), dict) else {}
-        labels = config.get("Labels")
-        labels = labels if isinstance(labels, dict) else {}
-        host_config = (
-            item.get("HostConfig") if isinstance(item.get("HostConfig"), dict) else {}
-        )
-
-        state_text = str(state.get("Status", "") or "unknown")
-        health = str(health_obj.get("Status", "") or "")
+    @staticmethod
+    def _inspect_int(value: object, default: Optional[int] = 0) -> Optional[int]:
         try:
-            exit_code = int(state.get("ExitCode", 0))
+            return int(value)  # type: ignore[arg-type]
         except (TypeError, ValueError):
-            exit_code = None
+            return default
+
+    def _container_from_inspect(self, item: dict[str, object]) -> Optional[Container]:
+        # `docker container inspect --format` (compact) uses lowercase keys;
+        # the default JSON output uses the Docker API's uppercase keys. Support
+        # both so fallback paths and older output remain parseable.
+        compact = "labels" in item and "state" in item and "id" in item
+        if compact:
+            labels = item.get("labels")
+            labels = labels if isinstance(labels, dict) else {}
+            state_text = str(item.get("state", "") or "unknown")
+            health = str(item.get("health", "") or "")
+            exit_code = self._inspect_int(item.get("exit_code"))
+            restart_count = self._inspect_int(item.get("restart_count"), 0) or 0
+            name = str(item.get("name", "") or "").lstrip("/")
+            image_name = str(item.get("image", "") or "")
+            image_id = str(item.get("image_id", "") or "")
+            created = str(item.get("created", "") or "")
+            bindings = item.get("port_bindings")
+            bindings = bindings if isinstance(bindings, dict) else {}
+        else:
+            state = item.get("State") if isinstance(item.get("State"), dict) else {}
+            health_obj = (
+                state.get("Health") if isinstance(state.get("Health"), dict) else {}
+            )
+            config = item.get("Config") if isinstance(item.get("Config"), dict) else {}
+            labels = config.get("Labels")
+            labels = labels if isinstance(labels, dict) else {}
+            host_config = (
+                item.get("HostConfig")
+                if isinstance(item.get("HostConfig"), dict)
+                else {}
+            )
+            state_text = str(state.get("Status", "") or "unknown")
+            health = str(health_obj.get("Status", "") or "")
+            exit_code = self._inspect_int(state.get("ExitCode", 0))
+            restart_count = self._inspect_int(item.get("RestartCount", 0), 0) or 0
+            name = str(item.get("Name", "") or "").lstrip("/")
+            image_name = str(config.get("Image", "") or item.get("Image", "") or "")
+            image_id = str(item.get("Image", "") or "")
+            created = str(item.get("Created", "") or "")
+            bindings = host_config.get("PortBindings")
+            bindings = bindings if isinstance(bindings, dict) else {}
+
         status = state_text
         if health:
             status += f" ({health})"
         elif state_text == "exited" and exit_code is not None:
             status += f" ({exit_code})"
 
-        name = str(item.get("Name", "") or "").lstrip("/")
-        image_name = str(config.get("Image", "") or item.get("Image", "") or "")
-        image_id = str(item.get("Image", "") or "")
         project = labels.get("com.docker.compose.project")
         service = labels.get("com.docker.compose.service")
         working_dir = labels.get("com.docker.compose.project.working_dir")
@@ -528,29 +663,22 @@ class DockerClient:
                     files.append(path)
 
         ports: list[str] = []
-        bindings = host_config.get("PortBindings")
-        if isinstance(bindings, dict):
-            for container_port in sorted(bindings):
-                values = bindings[container_port]
-                if not isinstance(values, list):
+        for container_port in sorted(bindings):
+            values = bindings[container_port]
+            if not isinstance(values, list):
+                continue
+            for binding in values:
+                if not isinstance(binding, dict):
                     continue
-                for binding in values:
-                    if not isinstance(binding, dict):
-                        continue
-                    host_ip = str(binding.get("HostIp", "") or "")
-                    host_port = str(binding.get("HostPort", "") or "")
-                    if host_port:
-                        prefix = f"{host_ip}:" if host_ip else ""
-                        ports.append(f"{prefix}{host_port}->{container_port}")
+                host_ip = str(binding.get("HostIp", "") or "")
+                host_port = str(binding.get("HostPort", "") or "")
+                if host_port:
+                    prefix = f"{host_ip}:" if host_ip else ""
+                    ports.append(f"{prefix}{host_port}->{container_port}")
         ports = sorted(dict.fromkeys(ports))
 
-        try:
-            restart_count = int(item.get("RestartCount", 0) or 0)
-        except (TypeError, ValueError):
-            restart_count = 0
-
         return Container(
-            id=str(item.get("Id", "") or ""),
+            id=str(item.get("id", item.get("Id", "")) or ""),
             name=name,
             image=image_name,
             image_id=image_id,
@@ -564,7 +692,7 @@ class DockerClient:
             config_files=tuple(files),
             working_dir=str(working_dir) if working_dir else None,
             ports=tuple(ports),
-            created=str(item.get("Created", "") or ""),
+            created=created,
             config_hash=str(config_hash) if config_hash else None,
         )
 
@@ -586,6 +714,136 @@ class DockerClient:
         if not result.ok:
             return []
         return [item for item in parse_json_records(result.stdout) if isinstance(item, dict)]
+
+    def compose_ps(
+        self, files: Sequence[Path], *, project_name: Optional[str] = None
+    ) -> list[dict[str, object]]:
+        """Return Compose's own container summaries for one project."""
+
+        result = self._run_compose(
+            files,
+            ["ps", "-a", "--format", "json"],
+            timeout=self.config.command_timeout,
+            project_name=project_name,
+        )
+        if not result.ok:
+            return []
+        return [
+            item for item in parse_json_records(result.stdout) if isinstance(item, dict)
+        ]
+
+    def compose_images(
+        self, files: Sequence[Path], *, project_name: Optional[str] = None
+    ) -> dict[str, str]:
+        """Map container names to image IDs using `docker compose images`."""
+
+        result = self._run_compose(
+            files,
+            ["images", "--format", "json"],
+            timeout=self.config.command_timeout,
+            project_name=project_name,
+        )
+        if not result.ok:
+            return {}
+        mapping: dict[str, str] = {}
+        for item in parse_json_records(result.stdout):
+            if not isinstance(item, dict):
+                continue
+            name = (
+                item.get("ContainerName")
+                or item.get("Container")
+                or item.get("container")
+            )
+            image_id = (
+                item.get("ID")
+                or item.get("ImageId")
+                or item.get("ImageID")
+                or item.get("id")
+                or item.get("image_id")
+            )
+            if isinstance(name, str) and isinstance(image_id, str):
+                if name:
+                    mapping[name] = image_id
+                    mapping[name.lstrip("/")] = image_id
+        return mapping
+
+    def compose_containers(
+        self, files: Sequence[Path], *, project_name: Optional[str] = None
+    ) -> list[Container]:
+        """Build container records from Compose when global inspection is unavailable.
+
+        `docker ps`/`docker inspect` can be affected by CLI wrappers, output
+        limits, or context quirks that do not affect `docker compose ps`. This
+        fallback keeps update checks accurate while still using the same daemon
+        and project name as the Compose operation.
+        """
+
+        summaries = self.compose_ps(files, project_name=project_name)
+        if not summaries:
+            return []
+        images = self.compose_images(files, project_name=project_name)
+        normalised = self._normalise_files(files)
+        project_dir = normalised[0].parent if normalised else Path.cwd()
+        result: list[Container] = []
+        for item in summaries:
+            raw_name = _first_value(item, "Name", "name", "Names", "names")
+            name = str(raw_name or "").lstrip("/")
+            state_text = str(_first_value(item, "State", "state") or "unknown")
+            health = str(_first_value(item, "Health", "health") or "")
+            exit_code = self._inspect_int(
+                _first_value(item, "ExitCode", "exitCode", "exit_code")
+            )
+            image_name = str(_first_value(item, "Image", "image") or "")
+            image_id = images.get(name) or images.get(name.lstrip("/")) or ""
+            status = str(_first_value(item, "Status", "status") or state_text)
+            if health and health not in status:
+                status += f" ({health})"
+            ports: list[str] = []
+            publishers = _first_value(item, "Publishers", "publishers")
+            if isinstance(publishers, list):
+                for publisher in publishers:
+                    if not isinstance(publisher, dict):
+                        continue
+                    target = _first_value(
+                        publisher, "TargetPort", "targetPort", "target_port"
+                    )
+                    published = _first_value(
+                        publisher, "PublishedPort", "publishedPort", "published_port"
+                    )
+                    url = str(
+                        _first_value(publisher, "URL", "url") or ""
+                    )
+                    protocol = str(
+                        _first_value(publisher, "Protocol", "protocol") or "tcp"
+                    )
+                    if published:
+                        prefix = f"{url}:" if url else ""
+                        ports.append(f"{prefix}{published}->{target}/{protocol}")
+            result.append(
+                Container(
+                    id=str(_first_value(item, "ID", "id") or ""),
+                    name=name,
+                    image=image_name,
+                    image_id=image_id,
+                    state=state_text,
+                    status=status,
+                    health=health,
+                    restart_count=0,
+                    exit_code=exit_code,
+                    project=str(
+                        _first_value(item, "Project", "project") or project_name or ""
+                    )
+                    or None,
+                    service=str(_first_value(item, "Service", "service") or "")
+                    or None,
+                    config_files=tuple(Path(path) for path in files),
+                    working_dir=str(project_dir),
+                    ports=tuple(sorted(dict.fromkeys(ports))),
+                    created=str(_first_value(item, "Created", "created") or ""),
+                    config_hash=None,
+                )
+            )
+        return result
 
     # ------------------------------------------------------------------
     # Mutating Compose operations

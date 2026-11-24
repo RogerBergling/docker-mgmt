@@ -448,6 +448,12 @@ def _running_groups(
         listed = docker.compose_ls()
     except DockerError:
         listed = []
+    if listed and not containers:
+        warnings.append(
+            "docker compose ls reports running projects but docker ps sees no "
+            "containers; Compose and docker ps may be using different Docker "
+            "contexts (check DOCKER_HOST/DOCKER_CONTEXT and rootless vs root)"
+        )
     for item in listed:
         name = item.get("Name")
         if not isinstance(name, str) or not name:

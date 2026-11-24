@@ -25,6 +25,8 @@ from .security import check_project_trust
 
 ProgressCallback = Callable[[str], None]
 
+RUNNING_STATES = frozenset({"running", "restarting", "paused"})
+
 
 @dataclass
 class PullPreflight:
@@ -134,7 +136,7 @@ def _running_ids(
         if (
             container.project == project_name
             and container.service == service_name
-            and container.state in {"running", "restarting", "paused"}
+            and container.state in RUNNING_STATES
             and container.image_id
         ):
             if container.image_id not in values:
@@ -151,7 +153,7 @@ def check_project(
 ) -> ProjectUpdateReport:
     """Pull images for one project and report which services changed."""
 
-    report = ProjectUpdateReport(project=project)
+    report = ProjectUpdateReport(project=project, containers_seen=len(containers))
     if not project.valid:
         report.skipped_reason = project.error or "invalid Compose configuration"
         report.skipped_error = True
@@ -191,6 +193,29 @@ def check_project(
         service.name: _running_ids(containers, project.project_name, service.name)
         for service in project.services
     }
+    if any(not ids for ids in running.values()):
+        # The global `docker ps`/`inspect` path can miss containers because of
+        # CLI wrappers, output limits, or context quirks. Ask Compose directly
+        # before declaring a service not-running.
+        compose_containers = docker.compose_containers(
+            project.files, project_name=project.project_name
+        )
+        if compose_containers:
+            known_ids = {item.id for item in containers if item.id}
+            extra = [
+                item
+                for item in compose_containers
+                if item.id and item.id not in known_ids
+            ]
+            if extra:
+                containers = [*containers, *extra]
+                running = {
+                    service.name: _running_ids(
+                        containers, project.project_name, service.name
+                    )
+                    for service in project.services
+                }
+    report.containers_seen = len(containers)
 
     if progress:
         progress(f"Pulling images for {project.project_name}...")
@@ -246,7 +271,27 @@ def check_project(
             detail = _short(after_id)
         else:
             status = "not-running"
-            detail = "image is current; no running container"
+            detail = (
+                "image is current; no running container with Compose labels "
+                f"project={project.project_name!r}, service={service.name!r}"
+            )
+            if not containers:
+                detail += " (docker-mgmt sees no containers)"
+            else:
+                project_services = sorted(
+                    {
+                        item.service
+                        for item in containers
+                        if item.project == project.project_name
+                        and item.service
+                        and item.state in RUNNING_STATES
+                    }
+                )
+                if project_services:
+                    shown = ", ".join(repr(name) for name in project_services[:5])
+                    if len(project_services) > 5:
+                        shown += ", ..."
+                    detail += f"; running services in this project: {shown}"
 
         report.services.append(
             ServiceUpdate(
@@ -316,6 +361,7 @@ def report_to_dict(report: ProjectUpdateReport) -> dict[str, object]:
         "pull_error": report.pull_error,
         "skipped_reason": report.skipped_reason,
         "skipped_error": report.skipped_error,
+        "containers_seen": report.containers_seen,
         "has_updates": report.has_updates,
         "services": [
             {

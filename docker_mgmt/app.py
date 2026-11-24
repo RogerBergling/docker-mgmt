@@ -743,7 +743,7 @@ class App:
         ):
             return
 
-        containers = self._containers(quiet=True)
+        containers = self._containers()
         started = time.monotonic()
         try:
             with self._locked():
@@ -1270,7 +1270,7 @@ class App:
             return
         if not self._require_audit():
             return
-        containers = self._containers(quiet=True)
+        containers = self._containers()
         valid = [project for project in self.projects if project.valid]
         if not valid:
             self.ui.warn("No valid projects to check.")
@@ -1355,6 +1355,13 @@ class App:
             )
         else:
             self.ui.info("No services to report.")
+
+        if reports and all(report.containers_seen == 0 for report in reports):
+            self.ui.warn(
+                "docker-mgmt sees no containers; if Compose services are running, "
+                "verify the Docker context (DOCKER_HOST/DOCKER_CONTEXT), the user, "
+                "and rootful vs rootless Docker."
+            )
 
         changed = sum(len(report.changed_services()) for report in reports)
         errors = [report for report in reports if report.has_errors]

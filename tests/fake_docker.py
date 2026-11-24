@@ -149,9 +149,69 @@ def main(argv: list[str]) -> int:
         if sub == "ls":
             print(json.dumps(state.get("compose_ls", [])))
             return 0
+        if sub in {"ps", "images"}:
+            project = ""
+            for index, token in enumerate(argv):
+                if token in {"-p", "--project-name"} and index + 1 < len(argv):
+                    project = argv[index + 1]
+                elif token.startswith("--project-name=") or token.startswith("-p="):
+                    project = token.split("=", 1)[1]
+            target = str(files[0]) if files else ""
+            if not project:
+                project = (
+                    (state.get("compose", {}).get(target) or {}).get("name", "")
+                )
+            selected = [
+                container
+                for container in state.get("containers", [])
+                if container.get("Config", {})
+                .get("Labels", {})
+                .get("com.docker.compose.project")
+                == project
+            ]
+            if sub == "ps":
+                for container in selected:
+                    labels = container.get("Config", {}).get("Labels", {}) or {}
+                    state_obj = container.get("State", {}) or {}
+                    health_obj = state_obj.get("Health", {}) or {}
+                    print(
+                        json.dumps(
+                            {
+                                "ID": container.get("Id", ""),
+                                "Name": container.get("Name", "").lstrip("/"),
+                                "Image": container.get("Config", {}).get(
+                                    "Image", ""
+                                ),
+                                "Project": project,
+                                "Service": labels.get(
+                                    "com.docker.compose.service", ""
+                                ),
+                                "State": state_obj.get("Status", ""),
+                                "Status": "Up",
+                                "Health": health_obj.get("Status", ""),
+                                "ExitCode": state_obj.get("ExitCode", 0),
+                                "Publishers": [],
+                            }
+                        )
+                    )
+                return 0
+            images = [
+                {
+                    "ID": container.get("Image", ""),
+                    "ContainerName": container.get("Name", "").lstrip("/"),
+                    "Repository": "",
+                    "Tag": "",
+                    "Size": 0,
+                }
+                for container in selected
+            ]
+            print(json.dumps(images))
+            return 0
         return fail(f"fake docker: unsupported compose subcommand {sub!r}")
 
     if argv[0] == "ps":
+        if state.get("ps_empty"):
+            return 0
         containers = state.get("containers", [])
         if "-a" not in argv:
             containers = [c for c in containers if c.get("State", {}).get("Status") == "running"]
@@ -159,12 +219,58 @@ def main(argv: list[str]) -> int:
             print(container.get("Id", ""))
         return 0
 
-    if argv[0] == "inspect":
-        ids = [value for value in argv[1:] if not value.startswith("-") and value != "container"]
+    if argv[0] == "inspect" or argv[:2] == ["container", "inspect"]:
+        if state.get("inspect_fail"):
+            return fail(str(state.get("inspect_error", "fake docker: inspect failed")))
+        args = argv[1:] if argv[0] == "inspect" else argv[2:]
+        if state.get("compact_inspect_fail") and "--format" in args:
+            return fail("fake docker: unknown flag: --format")
+        ids: list[str] = []
+        format_value = ""
+        index = 0
+        while index < len(args):
+            value = args[index]
+            if value in {"--format", "-f"}:
+                if index + 1 < len(args):
+                    format_value = args[index + 1]
+                index += 2
+                continue
+            if value == "--type":
+                index += 2
+                continue
+            if value in {"--", "container"} or value.startswith("-"):
+                index += 1
+                continue
+            ids.append(value)
+            index += 1
         containers = state.get("containers", [])
         selected = [c for c in containers if c.get("Id") in ids]
         if not selected:
             return fail("fake docker: no such container")
+        if format_value:
+            for item in selected:
+                config = item.get("Config", {})
+                state_obj = item.get("State", {})
+                health_obj = state_obj.get("Health", {}) or {}
+                labels = config.get("Labels", {}) or {}
+                record = {
+                    "id": item.get("Id", ""),
+                    "image_id": item.get("Image", ""),
+                    "image": config.get("Image", ""),
+                    "state": state_obj.get("Status", ""),
+                    "health": health_obj.get("Status", ""),
+                    "restart_count": item.get("RestartCount", 0),
+                    "exit_code": state_obj.get("ExitCode", 0),
+                    "name": item.get("Name", ""),
+                    "created": item.get("Created", ""),
+                    "labels": labels,
+                    "port_bindings": item.get("HostConfig", {}).get(
+                        "PortBindings", {}
+                    )
+                    or {},
+                }
+                print(json.dumps(record, sort_keys=True))
+            return 0
         print(json.dumps(selected))
         return 0
 

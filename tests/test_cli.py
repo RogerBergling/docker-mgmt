@@ -129,9 +129,82 @@ class CliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 10, proc.stderr)
         payload = json.loads(proc.stdout)
         self.assertEqual(payload["updates"], 1)
+        self.assertEqual(payload["containers_seen"], 1)
         self.assertEqual(
             payload["reports"][0]["services"][0]["status"], "image-updated"
         )
+
+    def test_check_falls_back_to_compose_when_ps_is_empty(self) -> None:
+        state = self.state
+        state["ps_empty"] = True
+        state["pull_updates"] = {}
+        write_state(self.env, state)
+        proc = self.invoke("check", "--yes", "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload["reports"][0]["containers_seen"], 1)
+        self.assertEqual(
+            payload["reports"][0]["services"][0]["status"], "up-to-date"
+        )
+
+    def test_check_compose_fallback_detects_stale_image(self) -> None:
+        state = self.state
+        state["ps_empty"] = True
+        state["pull_updates"] = {}
+        state["images"]["nginx:1.27"] = self.new_image_id
+        write_state(self.env, state)
+        proc = self.invoke("check", "--yes", "--json")
+        self.assertEqual(proc.returncode, 10, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload["reports"][0]["containers_seen"], 1)
+        self.assertEqual(
+            payload["reports"][0]["services"][0]["status"], "container-stale"
+        )
+
+    def test_check_warns_when_no_containers_are_visible(self) -> None:
+        state = self.state
+        state["containers"] = []
+        state["pull_updates"] = {}
+        write_state(self.env, state)
+        proc = self.invoke("check", "--yes", "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload["containers_seen"], 0)
+        self.assertTrue(
+            any("0 containers" in warning for warning in payload["warnings"])
+        )
+        self.assertIn("warning: docker-mgmt sees 0 containers", proc.stderr)
+        service = payload["reports"][0]["services"][0]
+        self.assertEqual(service["status"], "not-running")
+        self.assertIn("sees no containers", service["detail"])
+
+    def test_status_warns_when_no_containers_are_visible(self) -> None:
+        state = self.state
+        state["containers"] = []
+        write_state(self.env, state)
+        proc = self.invoke("status")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("verify the Docker context", proc.stdout)
+
+    def test_status_fails_loudly_when_inspect_fails(self) -> None:
+        state = self.state
+        state["inspect_fail"] = True
+        state["inspect_error"] = "permission denied"
+        write_state(self.env, state)
+        proc = self.invoke("status", "--json")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("none could be inspected", proc.stderr)
+        self.assertIn("permission denied", proc.stderr)
+
+    def test_status_falls_back_to_full_inspect(self) -> None:
+        state = self.state
+        state["compact_inspect_fail"] = True
+        write_state(self.env, state)
+        proc = self.invoke("status", "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload["running"], 1)
+        self.assertEqual(payload["containers"][0]["project"], "demo")
 
     def test_check_requires_yes_noninteractively(self) -> None:
         proc = self.invoke("check", "--json")
@@ -205,6 +278,7 @@ class CliTests(unittest.TestCase):
         proc = self.invoke("doctor")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("Docker Compose", proc.stdout)
+        self.assertIn("Containers visible", proc.stdout)
         self.assertIn("Security posture", proc.stdout)
 
     def test_audit_without_docker(self) -> None:

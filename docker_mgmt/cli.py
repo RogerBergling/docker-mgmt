@@ -31,6 +31,7 @@ from .discovery import (
 )
 from .docker import (
     DockerClient,
+    DockerError,
     DockerUnavailable,
 )
 from .models import ComposeProject, ProjectUpdateReport
@@ -345,6 +346,11 @@ def command_status(args: argparse.Namespace, config: Config, docker: DockerClien
     )
     if not containers:
         ui.info("No containers found.")
+        ui.warn(
+            "If Docker containers are running, verify the Docker context "
+            "(DOCKER_HOST/DOCKER_CONTEXT), the user running docker-mgmt, and "
+            "rootful vs rootless Docker."
+        )
         return 0
     ui.print_table(
         ["NAME", "PROJECT", "SERVICE", "STATE", "HEALTH", "RESTARTS", "IMAGE", "PORTS"],
@@ -391,7 +397,11 @@ def command_check(
             return 0
     if not _ensure_audit(audit):
         return 2
-    containers = docker.list_containers(all_containers=True)
+    try:
+        containers = docker.list_containers(all_containers=True)
+    except DockerError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     reports: list[ProjectUpdateReport] = []
     progress = (
         None
@@ -417,6 +427,7 @@ def command_check(
                     reports.append(
                         ProjectUpdateReport(
                             project=project,
+                            containers_seen=len(containers),
                             skipped_reason="pull preflight failed: "
                             + "; ".join(preflight.errors),
                             skipped_error=True,
@@ -445,6 +456,15 @@ def command_check(
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    if not containers and not any(report.containers_seen for report in reports):
+        warning = (
+            "docker-mgmt sees 0 containers; if Compose services are running, "
+            "verify the Docker context (DOCKER_HOST/DOCKER_CONTEXT), the user "
+            "running docker-mgmt, and rootful vs rootless Docker"
+        )
+        warnings.append(warning)
+        print(f"warning: {warning}", file=sys.stderr)
+
     if args.json:
         print(
             json.dumps(
@@ -452,6 +472,8 @@ def command_check(
                     "reports": [report_to_dict(report) for report in reports],
                     "updates": sum(len(r.changed_services()) for r in reports),
                     "errors": sum(1 for r in reports if r.has_errors),
+                    "containers_seen": len(containers),
+                    "warnings": warnings,
                 },
                 indent=2,
                 sort_keys=True,
@@ -910,6 +932,15 @@ def command_doctor(
     else:
         ui.error("docker CLI not found in PATH")
 
+    containers_visible: object = "unavailable"
+    container_probe_error: Optional[str] = None
+    if docker_ok:
+        try:
+            containers_visible = len(docker.list_containers(all_containers=True))
+        except DockerError as exc:
+            containers_visible = "ERROR"
+            container_probe_error = str(exc)
+
     audit_ok = False
     try:
         audit.ensure_ready()
@@ -950,6 +981,7 @@ def command_doctor(
             ("Docker CLI", docker_path or "MISSING"),
             ("Docker daemon", "ok" if docker_ok else "unavailable"),
             ("Docker Compose", docker.compose_version_string() if compose_ok else "unavailable"),
+            ("Containers visible", containers_visible),
             ("DOCKER_HOST", os.environ.get("DOCKER_HOST", "(local socket)")),
             ("DOCKER_CONTEXT", os.environ.get("DOCKER_CONTEXT", "(default)")),
             ("DOCKER_CONFIG", os.environ.get("DOCKER_CONFIG", "(default)")),
@@ -970,6 +1002,22 @@ def command_doctor(
     if candidate_warnings:
         ui.section("Scan warnings")
         ui.bullets(candidate_warnings[:20])
+    if container_probe_error:
+        ui.section("Container visibility")
+        ui.error(container_probe_error)
+        ui.bullets(
+            [
+                "docker ps reported containers but they could not be inspected; "
+                "verify the Docker context, permissions, and any docker CLI wrapper.",
+            ]
+        )
+    elif containers_visible == 0:
+        ui.section("Container visibility")
+        ui.warn(
+            "Docker is reachable but no containers are visible. If containers are "
+            "running, verify DOCKER_HOST/DOCKER_CONTEXT, whether they run in a "
+            "rootless daemon, and whether docker-mgmt uses the same user/context."
+        )
     ui.section("Security posture")
     ui.bullets(
         [

@@ -446,6 +446,13 @@ while `1` means "errors occurred and the result may be incomplete".
 5. Records the image IDs of running containers for the project.
 6. Compares them.
 
+Running containers are matched by the Compose labels
+`com.docker.compose.project` and `com.docker.compose.service`. If the global
+`docker ps`/`docker inspect` view misses a project, `check` asks
+`docker compose ps`/`docker compose images` before declaring a service
+`not-running`. `check --json` includes `containers_seen` per report and a
+top-level warning when no containers are visible at all.
+
 A project that fails the preflight is skipped with an error unless `security.allow_unsafe_ownership` (for file-trust issues) or `security.allow_unverified_references` (for `include`/`extends`) is explicitly enabled; in those cases the check prints a warning and continues. High-risk Compose settings only produce a warning for `check`, because pulling does not recreate containers. `check` never runs `compose up -d`.
 
 Service statuses:
@@ -456,13 +463,18 @@ Service statuses:
 | `new-image` | The image was missing locally and was pulled. |
 | `container-stale` | The local tag did not move, but a running container uses an older image ID. |
 | `up-to-date` | Local image and running container match. |
-| `not-running` | Image is current, but no running container was found. |
+| `not-running` | Image is current, but no running container with matching Compose project/service labels was found. |
 | `build-only` | The service has a build section and no pullable image; skipped. |
 | `pull-failed` | The pull failed and no change could be confirmed. |
 | `skipped` | The project was invalid or had no services to check. |
 
 Important details:
 
+- **`not-running` is label-based.** A container that is up and serving traffic
+  still shows `not-running` if it was started with plain `docker run` or under
+  a different Compose project/service name. Run `docker-mgmt status` to see the
+  project/service labels docker-mgmt sees. Standalone containers are visible in
+  `status` and can be managed individually, but update checks are Compose-only.
 - **Pulling changes local tags but does not restart containers.** The running
   image ID can therefore differ from the newly pulled tag. This is reported as
   `container-stale`.
@@ -637,6 +649,8 @@ Before applying updates to production, verify that:
 | `DOCKER_HOST is set` warning | Unset it for a local daemon, or confirm the remote daemon is the intended target. |
 | `DOCKER_CONTEXT` warning | Verify the active Docker context is local (`docker context show`); remote contexts are root-equivalent too. |
 | `DOCKER_CONFIG` / `HOME/.docker` warning | Make the Docker config directory owned by root/you and not group/world-writable, or unset the variable. |
+| All services show `not-running` although they work | Run `docker-mgmt status` and compare the `PROJECT`/`SERVICE` labels with the Compose file. Plain `docker run` containers have no Compose labels. If `check --json` shows `containers_seen: 0`, run `docker-mgmt doctor` and compare `docker ps` with `sudo docker ps`, `docker context show`, `DOCKER_HOST`, and rootless vs rootful Docker. |
+| `docker ps reported N container(s), but none could be inspected` | The Docker CLI reported container IDs but `docker inspect` failed. Check the CLI wrapper/context and permissions; `docker-mgmt doctor` shows how many containers are visible. |
 
 ## Repository layout
 
