@@ -1,5 +1,7 @@
 # docker-mgmt
 
+**Project facts (2026-11-25):** version **0.1.0** · Python 3.9+ standard library · 81 unit tests · MIT licensed.
+
 A safer, menu-driven way to check and update Docker Compose services on one
 host.
 
@@ -303,7 +305,9 @@ change it can redirect the tool to attacker-controlled Compose files.
 | `security` | `allow_unsafe_ownership` | `false` | **Dangerous.** Allow mutating actions when project files are not controlled by root/current user or are group/world-writable. |
 | `security` | `allow_unverified_references` | `false` | **Dangerous.** Allow mutating actions when Compose uses `include`/`extends` references that cannot be individually trust-checked. |
 
-The operation lock path is not configurable:
+The operation lock path defaults to the config directory. The advanced/testing
+`DOCKER_MGMT_LOCK` environment variable can override it; the lock is a
+coordination mechanism, not an authorization boundary.
 
 - root: `/run/docker-mgmt/docker-mgmt.lock`
 - non-root: `$XDG_RUNTIME_DIR/docker-mgmt.lock`, or a private directory under
@@ -439,7 +443,7 @@ while `1` means "errors occurred and the result may be incomplete".
 
 `check` does this for each project:
 
-1. Runs a non-interactive pull preflight: project validity, blockers, unverified `include`/`extends` references, and file-trust checks.
+1. Runs a non-interactive pull preflight: project validity, blockers, unverified `include`/`extends` references, and file-trust checks. The interactive **Check for updates** menu runs the same preflight and skips failing projects.
 2. Records the local image ID for every service image.
 3. Runs `docker compose pull --quiet --ignore-buildable`.
 4. Records the local image ID again.
@@ -511,6 +515,11 @@ Full details and a threat model are in [SECURITY.md](SECURITY.md). Key controls:
   `docker` earlier in `PATH` is refused. Root runs also refuse a `PATH` or
   `DOCKER_CONFIG`/`HOME/.docker` path that is not root-controlled, because
   Docker can load credential helpers and CLI plugins from them.
+- **Root installation check.** A root run from a checkout, package directory or
+  wrapper that is not root-controlled is refused, because a local user could
+  edit code that root executes next. Install to a root-owned directory such as
+  `/opt/docker-mgmt`. `--allow-unsafe-install` is the explicit, reviewed
+  override; do not use it on a shared host.
 - **Remote daemon warnings.** `DOCKER_HOST` and `DOCKER_CONTEXT` are reported
   when they may target a remote daemon. Root runs refuse an unsafe `PATH`,
   `DOCKER_CONFIG`, or `HOME/.docker` path as described above.

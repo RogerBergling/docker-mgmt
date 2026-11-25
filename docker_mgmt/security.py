@@ -435,12 +435,12 @@ def check_project_trust(
     return issues
 
 
-def installation_warnings(*, euid: Optional[int] = None) -> list[str]:
-    """Warn when a root run uses code from a non-root-controlled checkout.
+def installation_issues(*, euid: Optional[int] = None) -> list[str]:
+    """Return trust issues for the running installation.
 
-    The check cannot protect an already-compromised process, but it avoids the
-    common mistake of running `sudo ./docker-mgmt` from a user-writable home
-    directory in production.
+    A root run from a user-writable checkout is a direct local privilege
+    escalation: the user can edit code that root will execute next. Callers
+    must fail closed; ``--allow-unsafe-install`` is the explicit override.
     """
 
     euid = os.geteuid() if euid is None else euid
@@ -458,6 +458,13 @@ def installation_warnings(*, euid: Optional[int] = None) -> list[str]:
             if issue not in seen:
                 seen.add(issue)
                 issues.append(issue)
+    return issues
+
+
+def installation_warnings(*, euid: Optional[int] = None) -> list[str]:
+    """Compatibility wrapper used by the menu and reports."""
+
+    issues = installation_issues(euid=euid)
     if not issues:
         return []
     return [

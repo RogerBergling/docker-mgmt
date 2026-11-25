@@ -1277,23 +1277,37 @@ class App:
             self.ui.pause()
             return
 
+        pullable = []
+        for project in valid:
+            preflight = pull_preflight(project, self.config)
+            if not preflight.ok:
+                self.ui.warn(
+                    f"Skipping {project.project_name}: "
+                    + "; ".join(preflight.errors[:3])
+                )
+                continue
+            for warning in preflight.warnings:
+                self.ui.warn(f"{project.project_name}: {warning}")
+            pullable.append(project)
+        if not pullable:
+            self.ui.warn("No projects passed the pull preflight.")
+            self.ui.pause()
+            return
+
         self.ui.info(
-            f"Ready to pull images for {len(valid)} project(s). This does not "
+            f"Ready to pull images for {len(pullable)} project(s). This does not "
             "restart containers and may use significant bandwidth."
         )
         self.ui.info(
             "Each project runs: docker compose ... pull --quiet --ignore-buildable"
         )
-        for project in valid:
-            if project.blockers:
-                self.ui.warn(f"Note: {project.project_name} has blockers; pull is allowed.")
         if not self.ui.confirm("Start update check?", default=False):
             return
 
         reports: list[ProjectUpdateReport] = []
         try:
             with self._locked():
-                for project in valid:
+                for project in pullable:
                     project_started = time.monotonic()
                     report = check_project(
                         self.docker,

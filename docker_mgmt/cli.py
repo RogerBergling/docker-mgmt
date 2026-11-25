@@ -36,7 +36,7 @@ from .docker import (
 )
 from .models import ComposeProject, ProjectUpdateReport
 from .runner import CommandRunner, DockerMgmtError, redact_text, summarize_output
-from .security import check_project_trust, installation_warnings
+from .security import check_project_trust, installation_issues, installation_warnings
 from .ui import UI
 from .updates import (
     check_exit_code,
@@ -78,6 +78,15 @@ def _common_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=argparse.SUPPRESS,
         help="show a Python traceback for unexpected errors",
+    )
+    parser.add_argument(
+        "--allow-unsafe-install",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=(
+            "allow a root run from a non-root-controlled checkout; this is a "
+            "local privilege-escalation risk and is refused by default"
+        ),
     )
     return parser
 
@@ -1049,10 +1058,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     command = args.command or "menu"
+    install_issues = installation_issues()
+    if install_issues:
+        if not getattr(args, "allow_unsafe_install", False):
+            print(
+                "error: refusing to run as root from a path that is not "
+                "root-controlled. A local user could modify code executed as "
+                "root. Install to a root-owned directory (for example "
+                "/opt/docker-mgmt), or pass --allow-unsafe-install after "
+                "reviewing the risk.",
+                file=sys.stderr,
+            )
+            for issue in install_issues[:5]:
+                print(f"  {issue}", file=sys.stderr)
+            return 2
+        for issue in installation_warnings():
+            print(f"warning: {issue}", file=sys.stderr)
     if command != "menu":
         _print_config_warnings(config)
-        for warning in installation_warnings():
-            print(f"warning: {warning}", file=sys.stderr)
         for warning in docker.environment_warnings():
             print(f"warning: {warning}", file=sys.stderr)
 
